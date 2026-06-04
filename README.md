@@ -17,6 +17,12 @@ oneconnect is a storage gateway web app for connecting multiple Google Drive acc
 - File preview, download, rename, move, and delete actions.
 - Bottom-right upload progress panel.
 
+## Preview
+
+![oneconnect dashboard preview](https://i.ibb.co.com/HLjG3JRf/image.png)
+
+![oneconnect shared file preview](https://i.ibb.co.com/QLpYGmx/image.png)
+
 ## Project Structure
 
 ```txt
