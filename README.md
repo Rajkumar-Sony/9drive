@@ -27,6 +27,10 @@ Live preview: https://oneconnect.zenhosta.com
 
 ![oneconnect shared file preview](https://i.ibb.co.com/QLpYGmx/image.png)
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=zenhosta/oneconnect&type=Date)](https://www.star-history.com/#zenhosta/oneconnect&Date)
+
 ## Project Structure
 
 ```txt
