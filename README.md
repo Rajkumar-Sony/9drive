@@ -40,7 +40,7 @@ Live preview: https://oneconnect.zenhosta.com
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=zenhosta/oneconnect&type=Date)](https://www.star-history.com/#zenhosta/oneconnect&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=zenhosta/oneconnect&type=Date)](https://star-history.dera.page/#zenhosta/oneconnect&type=Date)
 
 ## Project Structure
 
