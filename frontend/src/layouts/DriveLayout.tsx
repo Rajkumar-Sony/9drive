@@ -27,6 +27,7 @@ const pageNames: Record<string, string> = {
   '/shared': 'Shared',
   '/trash': 'Trash',
   '/quota': 'Accounts & quota',
+  '/transfers': 'Transfers',
   '/activity': 'Activity',
   '/settings': 'Settings',
   '/api': 'API keys',

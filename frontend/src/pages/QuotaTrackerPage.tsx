@@ -10,7 +10,7 @@ import { Menu, MenuItem } from '@/components/ui/menu'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { useDriveLayoutActions } from '@/layouts/DriveLayout'
 import { accountLabel } from '@/lib/accounts'
-import { apiFetch, formatBytes } from '@/lib/api'
+import { apiFetch, formatBytes, getApiUrl } from '@/lib/api'
 import { isDesktop } from '@/lib/runtime'
 import { openExternal } from '@/lib/desktop'
 import { cn } from '@/lib/utils'
@@ -83,6 +83,10 @@ export function QuotaTrackerPage() {
   const [s3Form, setS3Form] = useState(EMPTY_S3)
   const [s3Error, setS3Error] = useState('')
   const [connectingS3, setConnectingS3] = useState(false)
+  const [oneDriveOpen, setOneDriveOpen] = useState(false)
+  const [oneDriveClientId, setOneDriveClientId] = useState('')
+  const [oneDriveClientSecret, setOneDriveClientSecret] = useState('')
+  const oneDriveRedirectUri = new URL(`${getApiUrl()}/connected-accounts/onedrive/callback`, window.location.origin).toString()
 
   async function load() {
     const [accountData, policyData] = await Promise.all([
@@ -107,7 +111,7 @@ export function QuotaTrackerPage() {
       if (event.origin !== window.location.origin || event.data?.type !== 'GOOGLE_CONNECTED') return
       if (event.data.status === 'success') {
         setError('')
-        setMessage('Google Drive connected.')
+        setMessage(`${event.data.provider === 'OneDrive' ? 'OneDrive' : 'Google Drive'} connected.`)
       } else {
         setMessage('')
         setError('Google Drive connection failed.')
@@ -175,6 +179,22 @@ export function QuotaTrackerPage() {
     } finally {
       setConnectingS3(false)
     }
+  }
+
+  async function connectOneDrive(event: FormEvent) {
+    event.preventDefault()
+    setConnecting(true)
+    setError('')
+    try {
+      const config = await apiFetch<{ id: string }>('/provider-configs/onedrive', { method: 'POST', body: JSON.stringify({ clientId: oneDriveClientId, clientSecret: oneDriveClientSecret, redirectUri: oneDriveRedirectUri, scopes: ['offline_access', 'User.Read', 'Files.ReadWrite'] }) })
+      const client = isDesktop ? 'desktop' : 'web'
+      const result = await apiFetch<{ url: string }>(`/connected-accounts/onedrive/connect-url?providerConfigId=${encodeURIComponent(config.id)}&client=${client}`)
+      setOneDriveOpen(false)
+      setOneDriveClientSecret('')
+      if (isDesktop) await openExternal(result.url)
+      else window.open(result.url, 'onedrive-connect', 'width=540,height=720') ?? (window.location.href = result.url)
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'OneDrive connection failed.') }
+    finally { setConnecting(false) }
   }
 
   async function sync(accountId: string) {
@@ -246,6 +266,7 @@ export function QuotaTrackerPage() {
   const connectActions = (
     <>
       <Button variant="secondary" onClick={() => { setS3Error(''); setS3Open(true) }}><Database className="h-4 w-4" strokeWidth={1.5} />Connect S3</Button>
+      <Button variant="secondary" onClick={() => setOneDriveOpen(true)}>Connect OneDrive</Button>
       <Button onClick={connectDrive} disabled={connecting}><Cloud className="h-4 w-4" strokeWidth={1.5} />{connecting ? 'Opening...' : 'Connect Google Drive'}</Button>
     </>
   )
@@ -260,6 +281,9 @@ export function QuotaTrackerPage() {
   return (
     <>
       <PageHeader title="Accounts & quota" description="Connected storage, capacity, and where new uploads go." actions={connectActions} />
+      <Dialog open={oneDriveOpen} onClose={() => setOneDriveOpen(false)} title="Connect OneDrive" width={520} footer={<><Button variant="secondary" onClick={() => setOneDriveOpen(false)}>Cancel</Button><Button type="submit" form="onedrive-connect-form" disabled={connecting || !oneDriveClientId || !oneDriveClientSecret}>Continue to Microsoft</Button></>}>
+        <form id="onedrive-connect-form" onSubmit={(event) => void connectOneDrive(event)} className="grid gap-3 text-sm text-text"><p>Register a web app in Microsoft Entra, then add this redirect URI:</p><code className="break-all rounded-md bg-bg p-2 text-xs">{oneDriveRedirectUri}</code><label className="grid gap-1">Application (client) ID<Input value={oneDriveClientId} onChange={(event) => setOneDriveClientId(event.target.value)} required /></label><label className="grid gap-1">Client secret<Input type="password" value={oneDriveClientSecret} onChange={(event) => setOneDriveClientSecret(event.target.value)} required /></label><p className="text-xs text-muted">Permissions: offline_access, User.Read, Files.ReadWrite. The secret is encrypted by the server.</p></form>
+      </Dialog>
       {error ? <p role="alert" className="mt-5 rounded-[10px] border border-danger px-4 py-3 text-[13px] text-danger">{error}</p> : null}
       {message ? <p role="status" className="mt-5 rounded-[10px] border border-border bg-surface px-4 py-3 text-[13px] text-text">{message}</p> : null}
 

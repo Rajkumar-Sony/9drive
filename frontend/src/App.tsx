@@ -16,6 +16,7 @@ import { PublicFilePage } from '@/pages/PublicFilePage'
 import { ApiManagementPage } from '@/pages/ApiManagementPage'
 import { TrashPage } from '@/pages/TrashPage'
 import { ActivityLogPage } from '@/pages/ActivityLogPage'
+import { TransfersPage } from '@/pages/TransfersPage'
 import { UploadProvider } from '@/context/UploadContext'
 import { ServerSetupPage } from '@/pages/ServerSetupPage'
 import { DesktopReturnPage } from '@/pages/DesktopReturnPage'
@@ -58,6 +59,7 @@ function App() {
           <Route path="archived" element={<ArchivedPage />} />
           <Route path="trash" element={<TrashPage />} />
           <Route path="activity" element={<ActivityLogPage />} />
+          <Route path="transfers" element={<TransfersPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="api" element={<ApiManagementPage />} />
         </Route>

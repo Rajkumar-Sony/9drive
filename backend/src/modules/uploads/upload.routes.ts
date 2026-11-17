@@ -3,17 +3,21 @@ import type { NextFunction, Response } from 'express'
 import { Router } from 'express'
 import { Transform, type Readable } from 'node:stream'
 import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
 import { google } from '../google/google-apis.js'
 import type { ConnectedAccount, Folder, UploadSession } from '../../generated/prisma/client.js'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { driveParentForFolder, ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
-import { abortS3MultipartUpload, buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, deleteS3Key, getS3ConfigForAccount, isPrivateS3Endpoint, listS3UploadedParts, presignS3UploadParts, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
+import { abortS3MultipartUpload, buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, deleteS3Key, getS3ConfigForAccount, isPrivateS3Endpoint, listS3UploadedParts, presignS3UploadParts, syncS3Quota, uploadS3Object, uploadS3Part } from '../s3/s3.service.js'
 import { completedPartsInOrder, s3PartCount, s3PartSize } from '../../utils/s3-multipart.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { accountLabel } from '../../utils/account-label.js'
 import { nextOffsetFromRange } from '../../utils/resumable-range.js'
+import { oneDriveGraph, syncOneDriveQuota } from '../onedrive/onedrive.service.js'
+import { decryptText, encryptText } from '../../utils/crypto.js'
+import { storageProvider } from '../storage-providers/provider.js'
 
 export const uploadRouter = Router()
 
@@ -67,7 +71,7 @@ function byPriority<T extends { account: { id: string; createdAt: Date } }>(item
 
 async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByAccount = new Map<string, bigint>(), targetAccountId?: string | null) {
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
+    where: { userId, provider: { in: ['google_drive', 's3', 'onedrive'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
     include: { storageAccount: true },
   })
 
@@ -76,6 +80,8 @@ async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByA
     try {
       if (account.provider === 's3') {
         await syncS3Quota(account.id)
+      } else if (account.provider === 'onedrive') {
+        await syncOneDriveQuota(account.id)
       } else {
         await syncGoogleQuota(account.id)
       }
@@ -89,7 +95,7 @@ async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByA
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected' },
+    where: { userId, provider: { in: ['google_drive', 's3', 'onedrive'] }, status: 'connected' },
     include: { storageAccount: true },
   })
 
@@ -251,6 +257,12 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           completed.push({ ...provisionalFile, providerFileId, status: 'active', sizeBytes: provisionalFile.sizeBytes.toString() })
           logUpload('s3 upload completed', { sessionId: session.id, accountId: account.id, fileName })
           await auditUpload(req.user!.id, { id: provisionalFile.id, name: fileName }, meta.sizeBytes, account)
+        } else if (account.provider === 'onedrive') {
+          const stored = await storageProvider('onedrive').uploadStream({ userId: req.user!.id, account, fileId: randomUUID(), name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, body: counted.stream })
+          if (!sizeMatches()) return rejectSizeMismatch()
+          const file = await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'onedrive', providerFileId: stored.providerFileId, name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes } })
+          completed.push({ ...file, sizeBytes: file.sizeBytes.toString() })
+          await auditUpload(req.user!.id, file, meta.sizeBytes, account)
         } else {
           const auth = await getAuthedGoogleClient(account)
           const drive = google.drive({ version: 'v3', auth })
@@ -274,6 +286,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
 
         await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'completed', completedAt: new Date() } })
         if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
+        else if (account.provider === 'onedrive') syncOneDriveQuota(account.id).catch(() => undefined)
         else syncQuotaInBackground(account.id, session.id)
       } catch (error) {
         // Drain whatever is left so busboy can move on to the next part.
@@ -377,6 +390,7 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
       targetAccountId: z.string().nullable().optional(),
       // Desktop app: it sends the bytes straight to Google (session URI) or S3 (presigned parts).
       direct: z.boolean().optional(),
+      chunkedProxy: z.boolean().optional(),
     }).parse(req.body)
 
     const sizeBytes = BigInt(body.sizeBytes)
@@ -391,9 +405,10 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
       const config = await getS3ConfigForAccount(account.id, req.user!.id)
       // Without `direct`, or for a bucket on a private network the client may not reach, S3 uploads
       // go through the multipart endpoint (POST /uploads), which creates its own session.
-      if (!body.direct || (config.endpoint && await isPrivateS3Endpoint(config.endpoint))) {
+      if (!body.direct && !body.chunkedProxy) {
         return res.status(201).json({ provider: account.provider, direct: false, accountId: account.id, accountLabel: accountLabel(account), offset: 0 })
       }
+      const clientCanReachEndpoint = !config.endpoint || !await isPrivateS3Endpoint(config.endpoint)
       const session = await prisma.uploadSession.create({
         data: { userId: req.user!.id, targetConnectedAccountId: account.id, folderId, fileName: body.fileName, mimeType: body.mimeType, sizeBytes, status: 'uploading', provider: 's3' },
       })
@@ -401,7 +416,13 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
       const s3UploadId = await createS3MultipartUpload(config, objectKey, body.mimeType)
       await prisma.uploadSession.update({ where: { id: session.id }, data: { objectKey, s3UploadId } })
       const partSize = s3PartSize(sizeBytes)
-      return res.status(201).json({ provider: 's3', direct: true, sessionId: session.id, partSize, partCount: s3PartCount(sizeBytes, partSize), accountId: account.id, accountLabel: accountLabel(account), offset: 0 })
+      return res.status(201).json({ provider: 's3', direct: Boolean(body.direct && clientCanReachEndpoint), chunkedProxy: Boolean(body.chunkedProxy), sessionId: session.id, partSize, partCount: s3PartCount(sizeBytes, partSize), accountId: account.id, accountLabel: accountLabel(account), offset: 0 })
+    }
+    if (account.provider === 'onedrive') {
+      const initiated = await oneDriveGraph<{ uploadUrl: string }>(account, `/me/drive/root:/${encodeURIComponent(body.fileName)}:/createUploadSession`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'rename' } }) })
+      if (!initiated.uploadUrl || new URL(initiated.uploadUrl).protocol !== 'https:') throw new Error('OneDrive returned an invalid upload session URL.')
+      const session = await prisma.uploadSession.create({ data: { userId: req.user!.id, targetConnectedAccountId: account.id, folderId, fileName: body.fileName, mimeType: body.mimeType, sizeBytes, status: 'uploading', provider: 'onedrive', providerSessionData: { uploadUrlEncrypted: encryptText(initiated.uploadUrl) } } })
+      return res.status(201).json({ provider: 'onedrive', sessionId: session.id, accountId: account.id, accountLabel: accountLabel(account), offset: 0, chunkSize: 10 * 1024 * 1024 })
     }
     if (account.provider !== 'google_drive') return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'This account type cannot take uploads.' })
 
@@ -465,6 +486,16 @@ uploadRouter.get('/resumable/status/:id', requireAuth, async (req: AuthRequest, 
       return res.json({ status: 'completed', offset: session.sizeBytes.toString() })
     }
 
+    if (session.provider === 'onedrive') {
+      const payload = session.providerSessionData as { uploadUrlEncrypted?: string } | null
+      if (!payload?.uploadUrlEncrypted) return res.json({ status: 'failed', offset: '0' })
+      const response = await fetch(decryptText(payload.uploadUrlEncrypted))
+      if (!response.ok) return res.json({ status: 'failed', offset: '0' })
+      const state = await response.json() as { nextExpectedRanges?: string[] }
+      const offset = state.nextExpectedRanges?.[0]?.split('-')[0] ?? '0'
+      return res.json({ status: 'uploading', offset, chunkSize: 10 * 1024 * 1024 })
+    }
+
     if (!session.googleSessionUri || !session.targetConnectedAccountId) {
       return res.json({ status: 'uploading', offset: '0' })
     }
@@ -524,6 +555,23 @@ uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, r
       return res.status(400).json({ code: 'INVALID_CONTENT_RANGE', message: 'Content-Range does not match this upload session.' })
     }
 
+    if (session.provider === 'onedrive') {
+      const payload = session.providerSessionData as { uploadUrlEncrypted?: string } | null
+      if (!payload?.uploadUrlEncrypted || !session.targetConnectedAccountId) return res.status(400).json({ code: 'UPLOAD_SESSION_INVALID', message: 'OneDrive session is invalid.' })
+      const length = endByte - startByte + 1n
+      if (length > 60n * 1024n * 1024n || (endByte + 1n < totalBytes && length % (320n * 1024n) !== 0n)) return res.status(400).json({ code: 'INVALID_CHUNK_SIZE', message: 'OneDrive chunks must be aligned to 320 KiB.' })
+      const response = await fetch(decryptText(payload.uploadUrlEncrypted), { method: 'PUT', headers: { 'Content-Length': length.toString(), 'Content-Range': rangeHeader }, body: req as any, duplex: 'half' } as any)
+      if (!response.ok) return res.status(response.status >= 500 ? 502 : response.status).json({ code: 'ONEDRIVE_CHUNK_FAILED', message: 'OneDrive rejected the upload chunk.' })
+      const result = await response.json() as { id?: string; name?: string; size?: number; nextExpectedRanges?: string[] }
+      if (response.status === 200 || response.status === 201) {
+        if (!result.id || BigInt(result.size ?? -1) !== session.sizeBytes) return res.status(502).json({ code: 'UPLOAD_SIZE_MISMATCH', message: 'OneDrive destination size differs from the requested size.' })
+        const file = await prisma.file.create({ data: { userId: session.userId, connectedAccountId: session.targetConnectedAccountId, folderId: session.folderId, provider: 'onedrive', providerFileId: result.id, name: result.name ?? session.fileName, mimeType: session.mimeType, sizeBytes: session.sizeBytes } })
+        await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'completed', completedAt: new Date(), providerSessionData: undefined } })
+        return res.status(201).json({ status: 'completed', file: { ...file, sizeBytes: file.sizeBytes.toString() } })
+      }
+      return res.json({ status: 'uploading', offset: result.nextExpectedRanges?.[0]?.split('-')[0] ?? (endByte + 1n).toString() })
+    }
+
     if (!session.googleSessionUri || !session.targetConnectedAccountId) {
       return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'Only Google Drive resumable uploads supported.' })
     }
@@ -580,6 +628,9 @@ uploadRouter.delete('/resumable/:id', requireAuth, async (req: AuthRequest, res,
     if (session.provider === 's3' && session.s3UploadId && session.objectKey && session.targetConnectedAccountId) {
       const config = await getS3ConfigForAccount(session.targetConnectedAccountId, req.user!.id)
       await abortS3MultipartUpload(config, session.objectKey, session.s3UploadId).catch(() => undefined)
+    } else if (session.provider === 'onedrive') {
+      const payload = session.providerSessionData as { uploadUrlEncrypted?: string } | null
+      if (payload?.uploadUrlEncrypted) await fetch(decryptText(payload.uploadUrlEncrypted), { method: 'DELETE' }).catch(() => undefined)
     } else if (session.googleSessionUri) {
       await fetch(session.googleSessionUri, { method: 'DELETE' }).catch(() => undefined)
     }
@@ -601,6 +652,22 @@ async function loadS3Session(req: AuthRequest) {
 
 const sessionNotFound = (res: Response) => res.status(404).json({ code: 'UPLOAD_SESSION_NOT_FOUND', message: 'Upload session not found.' })
 
+uploadRouter.put('/s3/:id/parts/:partNumber', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const loaded = await loadS3Session(req)
+    if (!loaded) return sessionNotFound(res)
+    if (loaded.session.status !== 'uploading') return res.status(409).json({ code: 'UPLOAD_SESSION_CLOSED', message: 'This upload is closed.' })
+    const partNumber = z.coerce.number().int().min(1).max(10_000).parse(req.params.partNumber)
+    const partSize = s3PartSize(loaded.session.sizeBytes)
+    const partCount = s3PartCount(loaded.session.sizeBytes, partSize)
+    if (partNumber > partCount) return res.status(400).json({ code: 'INVALID_PART_NUMBER', message: 'Part is outside this upload.' })
+    const expected = Number(partNumber === partCount ? loaded.session.sizeBytes - BigInt(partSize) * BigInt(partNumber - 1) : BigInt(partSize))
+    if (Number(req.headers['content-length']) !== expected) return res.status(400).json({ code: 'INVALID_PART_SIZE', message: 'Part size does not match this upload session.' })
+    const etag = await uploadS3Part(loaded.config, loaded.objectKey, loaded.uploadId, partNumber, req, expected)
+    return res.json({ partNumber, etag })
+  } catch (error) { return next(error) }
+})
+
 // Presigned PUT URLs for some parts (valid for an hour; the client asks again for later parts).
 uploadRouter.post('/s3/:id/part-urls', requireAuth, async (req: AuthRequest, res, next) => {
   try {
@@ -621,8 +688,9 @@ uploadRouter.get('/s3/:id/parts', requireAuth, async (req: AuthRequest, res, nex
   try {
     const loaded = await loadS3Session(req)
     if (!loaded) return sessionNotFound(res)
-    if (loaded.session.status === 'completed') return res.json({ status: 'completed', parts: [] })
-    return res.json({ status: loaded.session.status, parts: await listS3UploadedParts(loaded.config, loaded.objectKey, loaded.uploadId) })
+    const partSize = s3PartSize(loaded.session.sizeBytes)
+    if (loaded.session.status === 'completed') return res.json({ status: 'completed', parts: [], partSize, partCount: s3PartCount(loaded.session.sizeBytes, partSize) })
+    return res.json({ status: loaded.session.status, parts: await listS3UploadedParts(loaded.config, loaded.objectKey, loaded.uploadId), partSize, partCount: s3PartCount(loaded.session.sizeBytes, partSize) })
   } catch (error) {
     return next(error)
   }

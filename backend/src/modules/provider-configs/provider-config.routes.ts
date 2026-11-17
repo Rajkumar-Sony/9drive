@@ -33,6 +33,16 @@ providerConfigRouter.post('/google', async (req: AuthRequest, res, next) => {
   }
 })
 
+providerConfigRouter.post('/onedrive', async (req: AuthRequest, res, next) => {
+  try {
+    const body = schema.parse(req.body)
+    const required = ['offline_access', 'User.Read', 'Files.ReadWrite']
+    if (!required.every((scope) => body.scopes.includes(scope))) return res.status(400).json({ code: 'ONEDRIVE_SCOPES_REQUIRED', message: `OneDrive needs ${required.join(', ')}.` })
+    const config = await prisma.providerConfig.create({ data: { userId: req.user!.id, provider: 'onedrive', clientIdEncrypted: encryptText(body.clientId), clientSecretEncrypted: encryptText(body.clientSecret), redirectUri: body.redirectUri, scopes: body.scopes } })
+    return res.status(201).json({ id: config.id, provider: config.provider, redirectUri: config.redirectUri, scopes: config.scopes, status: config.status })
+  } catch (error) { return next(error) }
+})
+
 providerConfigRouter.get('/', async (req: AuthRequest, res, next) => {
   try {
     const configs = await prisma.providerConfig.findMany({ where: { userId: req.user!.id }, select: { id: true, provider: true, redirectUri: true, scopes: true, status: true, createdAt: true } })

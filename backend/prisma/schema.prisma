@@ -33,6 +33,9 @@ model User {
   workspaceInvitesSent WorkspaceInvite[] @relation("WorkspaceInvitesSent")
   uploadRoutingPolicy UploadRoutingPolicy?
   apiKeys       ApiKey[]
+  transferJobs TransferJob[]
+  replicationPlans ReplicationPlan[]
+  vaultObjects VaultObject[]
 
   @@map("users")
 }
@@ -166,6 +169,10 @@ model ConnectedAccount {
   folders               Folder[]
   uploadSessions        UploadSession[]
   s3StorageConfig       S3StorageConfig?
+  transferSources TransferJob[] @relation("TransferSourceAccount")
+  transferDestinations TransferJob[] @relation("TransferDestinationAccount")
+  replicationSources ReplicationPlan[] @relation("ReplicationSourceAccount")
+  replicationDestinations ReplicationPlan[] @relation("ReplicationDestinationAccount")
 
   @@unique([userId, provider, providerAccountId])
   @@index([userId])
@@ -234,6 +241,8 @@ model File {
   folder             Folder?          @relation(fields: [folderId], references: [id], onDelete: SetNull)
   shares             FileShare[]
   previewTokens      FilePreviewToken[]
+  transferItems TransferJobItem[]
+  vaultObject VaultObject?
 
   @@index([userId])
   @@index([userId, status, createdAt])
@@ -339,6 +348,8 @@ model UploadSession {
   provider                 String            @default("google_drive") @db.VarChar(32)
   s3UploadId               String?           @map("s3_upload_id") @db.Text
   objectKey                String?           @map("object_key") @db.VarChar(1024)
+  providerSessionData      Json?             @map("provider_session_data")
+  relativePath             String?           @map("relative_path") @db.Text
   errorMessage             String?           @map("error_message") @db.Text
   createdAt                DateTime          @default(now()) @map("created_at")
   completedAt              DateTime?         @map("completed_at")
@@ -349,6 +360,124 @@ model UploadSession {
   @@index([userId])
   @@index([folderId])
   @@map("upload_sessions")
+}
+
+model TransferJob {
+  id                       String            @id @default(uuid()) @db.Char(36)
+  userId                   String            @map("user_id") @db.Char(36)
+  kind                     String            @db.VarChar(24)
+  status                   String            @default("queued") @db.VarChar(24)
+  sourceConnectedAccountId String            @map("source_connected_account_id") @db.Char(36)
+  destinationConnectedAccountId String       @map("destination_connected_account_id") @db.Char(36)
+  conflictPolicy            String            @default("keep_both") @map("conflict_policy") @db.VarChar(24)
+  priority                  Int               @default(0)
+  totalItems                Int               @default(0) @map("total_items")
+  completedItems            Int               @default(0) @map("completed_items")
+  failedItems               Int               @default(0) @map("failed_items")
+  attemptCount              Int               @default(0) @map("attempt_count")
+  maxAttempts               Int               @default(5) @map("max_attempts")
+  availableAt               DateTime           @default(now()) @map("available_at")
+  leaseOwner                String?            @map("lease_owner") @db.VarChar(191)
+  leaseExpiresAt            DateTime?          @map("lease_expires_at")
+  fencingToken              BigInt             @default(0) @map("fencing_token")
+  cancelRequestedAt         DateTime?          @map("cancel_requested_at")
+  lastError                 String?            @map("last_error") @db.Text
+  createdAt                 DateTime            @default(now()) @map("created_at")
+  updatedAt                 DateTime            @updatedAt @map("updated_at")
+  startedAt                 DateTime?           @map("started_at")
+  completedAt               DateTime?           @map("completed_at")
+  user                      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceConnectedAccount    ConnectedAccount   @relation("TransferSourceAccount", fields: [sourceConnectedAccountId], references: [id], onDelete: Restrict)
+  destinationConnectedAccount ConnectedAccount @relation("TransferDestinationAccount", fields: [destinationConnectedAccountId], references: [id], onDelete: Restrict)
+  items                     TransferJobItem[]
+
+  @@index([status, availableAt, priority, createdAt])
+  @@index([userId, createdAt])
+  @@index([leaseExpiresAt])
+  @@map("transfer_jobs")
+}
+
+model TransferJobItem {
+  id                 String      @id @default(uuid()) @db.Char(36)
+  jobId              String      @map("job_id") @db.Char(36)
+  sourceFileId       String      @map("source_file_id") @db.Char(36)
+  status             String      @default("queued") @db.VarChar(24)
+  sourceProviderId   String      @map("source_provider_id") @db.VarChar(191)
+  destinationProviderId String?  @map("destination_provider_id") @db.VarChar(191)
+  destinationFileId  String?     @map("destination_file_id") @db.Char(36)
+  destinationName    String      @map("destination_name") @db.VarChar(255)
+  sizeBytes          BigInt      @map("size_bytes")
+  checksum           String?     @db.VarChar(191)
+  bytesTransferred   BigInt      @default(0) @map("bytes_transferred")
+  attemptCount       Int         @default(0) @map("attempt_count")
+  lastError          String?     @map("last_error") @db.Text
+  createdAt          DateTime    @default(now()) @map("created_at")
+  updatedAt          DateTime    @updatedAt @map("updated_at")
+  completedAt        DateTime?   @map("completed_at")
+  job                TransferJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  sourceFile         File        @relation(fields: [sourceFileId], references: [id], onDelete: Restrict)
+
+  @@unique([jobId, sourceFileId])
+  @@index([jobId, status, createdAt])
+  @@index([sourceFileId])
+  @@map("transfer_job_items")
+}
+
+model ReplicationPlan {
+  id                       String            @id @default(uuid()) @db.Char(36)
+  userId                   String            @map("user_id") @db.Char(36)
+  sourceConnectedAccountId String            @map("source_connected_account_id") @db.Char(36)
+  destinationConnectedAccountId String       @map("destination_connected_account_id") @db.Char(36)
+  name                     String            @db.VarChar(191)
+  status                   String            @default("active") @db.VarChar(24)
+  scheduleCron             String?           @map("schedule_cron") @db.VarChar(100)
+  lastRunAt                DateTime?          @map("last_run_at")
+  nextRunAt                DateTime?          @map("next_run_at")
+  createdAt                DateTime            @default(now()) @map("created_at")
+  updatedAt                DateTime            @updatedAt @map("updated_at")
+  user                     User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mappings                 ReplicationMapping[]
+  sourceConnectedAccount   ConnectedAccount   @relation("ReplicationSourceAccount", fields: [sourceConnectedAccountId], references: [id], onDelete: Restrict)
+  destinationConnectedAccount ConnectedAccount @relation("ReplicationDestinationAccount", fields: [destinationConnectedAccountId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@index([status, nextRunAt])
+  @@map("replication_plans")
+}
+
+model ReplicationMapping {
+  id                 String          @id @default(uuid()) @db.Char(36)
+  planId             String          @map("plan_id") @db.Char(36)
+  sourceProviderId   String          @map("source_provider_id") @db.VarChar(191)
+  destinationProviderId String       @map("destination_provider_id") @db.VarChar(191)
+  sourceVersion      String?         @map("source_version") @db.VarChar(191)
+  checksum           String?         @db.VarChar(191)
+  lastReplicatedAt   DateTime?       @map("last_replicated_at")
+  createdAt          DateTime        @default(now()) @map("created_at")
+  updatedAt          DateTime        @updatedAt @map("updated_at")
+  plan               ReplicationPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, sourceProviderId])
+  @@index([destinationProviderId])
+  @@map("replication_mappings")
+}
+
+model VaultObject {
+  id                   String   @id @default(uuid()) @db.Char(36)
+  userId               String   @map("user_id") @db.Char(36)
+  fileId               String   @unique @map("file_id") @db.Char(36)
+  formatVersion        Int      @default(1) @map("format_version")
+  encryptedMetadata   Bytes    @map("encrypted_metadata") @db.LongBlob
+  salt                 Bytes    @db.VarBinary(64)
+  keyWrap              Bytes    @map("key_wrap") @db.LongBlob
+  encryptionAlgorithm String   @map("encryption_algorithm") @db.VarChar(64)
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  file                 File     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("vault_objects")
 }
 
 model AuditLog {

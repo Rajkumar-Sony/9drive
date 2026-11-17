@@ -13,6 +13,8 @@ import { createOAuthClient, syncGoogleQuota } from '../google/google.service.js'
 import { assertSafeS3Endpoint, syncS3Quota, testS3Connection } from '../s3/s3.service.js'
 import { storageProvider } from '../storage-providers/provider.js'
 import { oauthClientSchema, oauthReturnUrl } from '../../utils/oauth-return.js'
+import { exchangeOneDriveCode, oneDriveConnectUrl, syncOneDriveQuota } from '../onedrive/onedrive.service.js'
+import { decryptText } from '../../utils/crypto.js'
 
 export const connectedAccountRouter = Router()
 
@@ -167,6 +169,45 @@ connectedAccountRouter.get('/google/connect-url', requireAuth, async (req: AuthR
     return res.json({ url })
   } catch (error) {
     return next(error)
+  }
+})
+
+connectedAccountRouter.get('/onedrive/connect-url', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const query = z.object({ providerConfigId: z.string().uuid(), client: oauthClientSchema }).parse(req.query)
+    const config = await prisma.providerConfig.findFirst({ where: { id: query.providerConfigId, userId: req.user!.id, provider: 'onedrive', status: 'active' } })
+    if (!config) return res.status(404).json({ code: 'ONEDRIVE_CONFIG_NOT_FOUND', message: 'OneDrive configuration not found.' })
+    const state = randomToken()
+    await prisma.oauthState.create({ data: { userId: req.user!.id, providerConfigId: config.id, flow: 'connect', client: query.client, stateHash: hashToken(state), expiresAt: new Date(Date.now() + 10 * 60_000) } })
+    return res.json({ url: oneDriveConnectUrl(config, state) })
+  } catch (error) { return next(error) }
+})
+
+connectedAccountRouter.get('/onedrive/callback', async (req, res) => {
+  try {
+    const query = z.object({ code: z.string(), state: z.string() }).parse(req.query)
+    const stateHash = hashToken(query.state)
+    const oauthState = await prisma.oauthState.findUnique({ where: { stateHash }, include: { providerConfig: true } })
+    if (!oauthState?.userId || oauthState.flow !== 'connect' || oauthState.usedAt || oauthState.expiresAt < new Date() || oauthState.providerConfig.provider !== 'onedrive') return res.status(400).json({ code: 'ONEDRIVE_OAUTH_STATE_INVALID', message: 'OneDrive OAuth state is invalid or expired.' })
+    const claimed = await prisma.oauthState.updateMany({ where: { id: oauthState.id, usedAt: null, expiresAt: { gt: new Date() } }, data: { usedAt: new Date() } })
+    if (claimed.count !== 1) return res.status(400).json({ code: 'ONEDRIVE_OAUTH_STATE_USED', message: 'OneDrive OAuth state was already used.' })
+    const tokens = await exchangeOneDriveCode(oauthState.providerConfig, query.code)
+    if (!tokens.access_token || !tokens.refresh_token) throw new Error('OneDrive did not return offline access tokens.')
+    const response = await fetch('https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,userPrincipalName', { headers: { Authorization: `Bearer ${tokens.access_token}` } })
+    if (!response.ok) throw new Error(`OneDrive profile request failed (${response.status}).`)
+    const profile = await response.json() as { id?: string; displayName?: string; mail?: string; userPrincipalName?: string }
+    if (!profile.id) throw new Error('OneDrive profile did not include an id.')
+    const account = await prisma.connectedAccount.upsert({
+      where: { userId_provider_providerAccountId: { userId: oauthState.userId, provider: 'onedrive', providerAccountId: profile.id } },
+      create: { userId: oauthState.userId, provider: 'onedrive', providerAccountId: profile.id, providerConfigId: oauthState.providerConfigId, email: profile.mail || profile.userPrincipalName || `${profile.id}@onedrive`, displayName: profile.displayName, accessTokenEncrypted: encryptText(tokens.access_token), refreshTokenEncrypted: encryptText(tokens.refresh_token), tokenExpiresAt: new Date(Date.now() + tokens.expires_in * 1000), scopes: oauthState.providerConfig.scopes as string[], status: 'connected' },
+      update: { providerConfigId: oauthState.providerConfigId, email: profile.mail || profile.userPrincipalName || `${profile.id}@onedrive`, displayName: profile.displayName, accessTokenEncrypted: encryptText(tokens.access_token), refreshTokenEncrypted: encryptText(tokens.refresh_token), tokenExpiresAt: new Date(Date.now() + tokens.expires_in * 1000), scopes: oauthState.providerConfig.scopes as string[], status: 'connected' },
+    })
+    await syncOneDriveQuota(account.id).catch(() => undefined)
+    await createAuditLog(oauthState.userId, 'CONNECT_ACCOUNT', 'account', account.id, { provider: 'onedrive' })
+    return res.redirect(oauthReturnUrl(env.FRONTEND_URL, oauthState.client, 'google-connected', { status: 'success', provider: 'onedrive' }))
+  } catch (error) {
+    console.error('OneDrive OAuth callback failed:', error instanceof Error ? error.message : error)
+    return res.redirect(`${env.FRONTEND_URL}/google-connected?status=error&provider=onedrive`)
   }
 })
 

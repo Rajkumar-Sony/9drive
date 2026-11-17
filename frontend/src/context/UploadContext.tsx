@@ -53,6 +53,28 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
   })
   const [resumableSessions, setResumableSessions] = useState<Record<string, ResumableSession>>({})
 
+  async function resolveUploadFolder(file: File, rootFolderId: string | null, cache: Map<string, string>) {
+    const path = file.webkitRelativePath
+    if (!path) return rootFolderId
+    const segments = path.split('/')
+    if (segments.length < 2 || segments.length > 33 || segments.some((segment) => !segment || segment === '.' || segment === '..' || segment.length > 255 || /[\\\u0000-\u001f]/.test(segment))) {
+      throw new Error('Folder path is invalid or too deep.')
+    }
+    let parentId = rootFolderId
+    for (const name of segments.slice(0, -1)) {
+      const key = `${parentId ?? 'root'}/${name}`
+      const cached = cache.get(key)
+      if (cached) { parentId = cached; continue }
+      const query = parentId ? `?parentId=${encodeURIComponent(parentId)}` : ''
+      const existing = await apiFetch<{ folders: Array<{ id: string; name: string }> }>(`/folders${query}`)
+      const found = existing.folders.find((folder) => folder.name === name)
+      const id = found?.id ?? (await apiFetch<{ folder: { id: string } }>('/folders', { method: 'POST', body: JSON.stringify({ name, parentId }) })).folder.id
+      cache.set(key, id)
+      parentId = id
+    }
+    return parentId
+  }
+
   function uploadSingleFileMultipart(file: File, folderId: string | null, accountId: string | null, onProgress: (percent: number) => void) {
     const attempt = () => new Promise<void>((resolve, reject) => {
       const form = new FormData()
@@ -111,6 +133,7 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
   async function uploadSingleFileResumable(uploadId: string, file: File, folderId: string | null, onProgress: (percent: number) => void, sessionIdToRetry?: string, targetAccountId?: string | null, onAccountLabel?: (label: string) => void) {
     let sessionId = sessionIdToRetry || ''
     let startOffset = 0
+    let chunkSize = CHUNK_SIZE
 
     // Pre-save session parameters so that retry is functional even if the init API call fails
     setResumableSessions(prev => ({
@@ -120,32 +143,45 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
 
     // 1. Initialize or get status
     if (!sessionId) {
-      const initData = await apiFetch<{ sessionId?: string; provider: string; accountId?: string; accountLabel?: string }>('/uploads/resumable/init', {
+      const initData = await apiFetch<{ sessionId?: string; provider: string; accountId?: string; accountLabel?: string; partSize?: number; partCount?: number; chunkSize?: number }>('/uploads/resumable/init', {
         method: 'POST',
         body: JSON.stringify({
           fileName: file.name,
           mimeType: file.type || 'application/octet-stream',
           sizeBytes: String(file.size),
           folderId: folderId || undefined,
-          targetAccountId: targetAccountId || undefined
+          targetAccountId: targetAccountId || undefined,
+          chunkedProxy: true
         })
       })
       if (initData.accountLabel) onAccountLabel?.(initData.accountLabel)
       if (initData.provider === 's3') {
-        // S3 has no resumable session: send the whole file as one multipart request.
-        await uploadSingleFileMultipart(file, folderId, initData.accountId ?? targetAccountId ?? null, onProgress)
+        if (!initData.sessionId || !initData.partSize || !initData.partCount) {
+          await uploadSingleFileMultipart(file, folderId, initData.accountId ?? targetAccountId ?? null, onProgress)
+          return
+        }
+        sessionId = initData.sessionId
+        setResumableSessions(prev => ({ ...prev, [uploadId]: { sessionId, file, folderId, targetAccountId } }))
+        await uploadBrowserS3Parts(sessionId, file, initData.partSize, initData.partCount, onProgress)
         return
       }
       if (!initData.sessionId) throw new Error('Upload session was not created')
       sessionId = initData.sessionId
+      chunkSize = initData.chunkSize ?? CHUNK_SIZE
       // Update session with the active sessionId
       setResumableSessions(prev => ({
         ...prev,
         [uploadId]: { sessionId, file, folderId, targetAccountId }
       }))
     } else {
-      const statusData = await apiFetch<{ status: string; offset: string }>(`/uploads/resumable/status/${sessionId}`)
+      const s3Status = await apiFetch<{ status: string; partSize: number; partCount: number }>(`/uploads/s3/${sessionId}/parts`).catch(() => null)
+      if (s3Status) {
+        await uploadBrowserS3Parts(sessionId, file, s3Status.partSize, s3Status.partCount, onProgress)
+        return
+      }
+      const statusData = await apiFetch<{ status: string; offset: string; chunkSize?: number }>(`/uploads/resumable/status/${sessionId}`)
       startOffset = Number(statusData.offset)
+      chunkSize = statusData.chunkSize ?? CHUNK_SIZE
       if (statusData.status === 'completed') {
         onProgress(100)
         return
@@ -155,7 +191,7 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
     // 2. Upload chunk by chunk
     let failedAttempts = 0
     while (startOffset < file.size) {
-      const endOffset = Math.min(startOffset + CHUNK_SIZE, file.size)
+      const endOffset = Math.min(startOffset + chunkSize, file.size)
       const chunk = file.slice(startOffset, endOffset)
 
       let response: Response | null = null
@@ -212,6 +248,36 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  async function uploadBrowserS3Parts(sessionId: string, file: File, partSize: number, partCount: number, onProgress: (percent: number) => void) {
+    const status = await apiFetch<{ status: string; parts: Array<{ partNumber: number; etag: string; size: number }> }>(`/uploads/s3/${sessionId}/parts`)
+    if (status.status === 'completed') { onProgress(100); return }
+    if (status.status !== 'uploading') throw new Error(`S3 upload is ${status.status}`)
+    const parts = new Map(status.parts.map((part) => [part.partNumber, part.etag]))
+    for (let partNumber = 1; partNumber <= partCount; partNumber++) {
+      if (parts.has(partNumber)) continue
+      const start = (partNumber - 1) * partSize
+      const chunk = file.slice(start, Math.min(start + partSize, file.size))
+      let lastError: Error | null = null
+      for (let attempt = 0; attempt < MAX_CHUNK_ATTEMPTS; attempt++) {
+        try {
+          const response = await authedFetch(`/uploads/s3/${sessionId}/parts/${partNumber}`, { method: 'PUT', body: chunk })
+          if (!response.ok) throw new Error(`S3 part ${partNumber} failed (${response.status})`)
+          const result = await response.json() as { etag: string }
+          parts.set(partNumber, result.etag)
+          lastError = null
+          break
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error('S3 part upload failed')
+          await sleep(Math.min(30_000, 1000 * 2 ** attempt))
+        }
+      }
+      if (lastError) throw lastError
+      onProgress(Math.min(99, Math.round((parts.size / partCount) * 100)))
+    }
+    await apiFetch(`/uploads/s3/${sessionId}/complete`, { method: 'POST', body: JSON.stringify({ parts: [...parts].sort(([a], [b]) => a - b).map(([partNumber, etag]) => ({ partNumber, etag })) }) })
+    onProgress(100)
+  }
+
   function updateFileProgress(uploadId: string, patch: Partial<UploadProgressFile>, overallStatus?: (files: UploadProgressFile[]) => UploadProgressStatus | undefined) {
     setUploadProgress((current) => {
       const files = current.files.map((f) => (f.id === uploadId ? { ...f, ...patch } : f))
@@ -223,6 +289,7 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
   async function uploadFiles(filesToUpload: File[], targetFolderId: string | null, targetAccountId?: string | null) {
     if (filesToUpload.length === 0) return
     const uploadIds = filesToUpload.map(() => newUploadId())
+    const folderCache = new Map<string, string>()
 
     // Setup initial status
     setUploadProgress({
@@ -242,7 +309,8 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
         files: current.files.map((f) => (f.id === uploadId && f.status === 'queued' ? { ...f, status: 'uploading' } : f)),
       }))
       try {
-        await uploadSingleFileResumable(uploadId, file, targetFolderId, (filePercent) => {
+        const fileFolderId = await resolveUploadFolder(file, targetFolderId, folderCache)
+        await uploadSingleFileResumable(uploadId, file, fileFolderId, (filePercent) => {
           updateFileProgress(uploadId, { percent: filePercent, status: filePercent >= 100 ? 'done' : 'uploading' })
         }, undefined, targetAccountId, (label) => updateFileProgress(uploadId, { accountLabel: label }))
       } catch (err) {

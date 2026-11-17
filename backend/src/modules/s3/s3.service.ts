@@ -115,6 +115,12 @@ export async function listS3UploadedParts(config: S3Config, key: string, uploadI
   return parts
 }
 
+export async function uploadS3Part(config: S3Config, key: string, uploadId: string, partNumber: number, body: Readable, contentLength: number) {
+  const result = await createS3Client(config).send(new UploadPartCommand({ Bucket: config.bucket, Key: key, UploadId: uploadId, PartNumber: partNumber, Body: body, ContentLength: contentLength }))
+  if (!result.ETag) throw new Error('S3 did not return a part ETag.')
+  return result.ETag
+}
+
 export async function completeS3MultipartUpload(config: S3Config, key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>) {
   const client = createS3Client(config)
   await client.send(new CompleteMultipartUploadCommand({

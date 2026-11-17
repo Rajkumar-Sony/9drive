@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { Braces, FileArchive, Gauge, History, Monitor, Plus, Settings, Share2, Trash2, Clock } from 'lucide-react'
+import { Braces, FileArchive, Gauge, History, Monitor, Plus, Settings, Share2, Trash2, Clock, ArrowRightLeft } from 'lucide-react'
 import { isDesktop } from '@/lib/runtime'
 import { Button } from '@/components/ui/button'
 import { formatBytes } from '@/lib/api'
@@ -15,6 +15,7 @@ const primaryNav = [
 ]
 const storageNav = [
   { label: 'Accounts & quota', icon: Gauge, href: '/quota' },
+  { label: 'Transfers', icon: ArrowRightLeft, href: '/transfers' },
   { label: 'Activity', icon: History, href: '/activity' },
 ]
 const footerNav = [

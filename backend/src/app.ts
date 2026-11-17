@@ -16,6 +16,7 @@ import { publicApiRouter } from './modules/public-api/public-api.routes.js'
 import { auditLogRouter } from './modules/audit-logs/audit-log.routes.js'
 import { systemRouter } from './modules/system/system.routes.js'
 import { appVersion } from './utils/app-version.js'
+import { transferRouter } from './modules/transfers/transfer.routes.js'
 
 export const app = express()
 // Trust X-Forwarded-For only from proxies on loopback/private networks (e.g. the bundled nginx).
@@ -33,6 +34,7 @@ app.use('/provider-configs', providerConfigRouter)
 app.use('/connected-accounts', connectedAccountRouter)
 app.use('/storage', storageRouter)
 app.use('/uploads', uploadRouter)
+app.use('/transfers', transferRouter)
 app.use('/files', fileRouter)
 app.use('/folders', folderRouter)
 app.use('/invites', inviteRouter)

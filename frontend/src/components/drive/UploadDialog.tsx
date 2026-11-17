@@ -42,7 +42,7 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
 
   function pick(list: FileList | File[] | null | undefined) {
     const next = Array.from(list ?? [])
-    if (next.length > 0) setFiles(next.map((file) => ({ name: file.name, size: file.size, file })))
+    if (next.length > 0) setFiles(next.map((file) => ({ name: file.webkitRelativePath || file.name, size: file.size, file })))
   }
 
   function pickLocal(picked: Array<{ path: string; name: string; size: number }>) {
@@ -123,6 +123,8 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
             <input type="file" multiple className="sr-only" onChange={(event) => pick(event.target.files)} />
           )}
         </label>
+
+        {!isDesktop ? <label className="inline-flex w-fit cursor-pointer items-center gap-2 text-[13px] font-medium text-accent hover:underline">Choose a folder<input type="file" multiple className="sr-only" {...{ webkitdirectory: '' }} onChange={(event) => pick(event.target.files)} /></label> : null}
 
         {files.length > 0 ? (
           <ul className="grid max-h-48 gap-1 overflow-y-auto rounded-lg border border-border p-1.5 text-[13px]">
