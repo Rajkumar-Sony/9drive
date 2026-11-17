@@ -1,5 +1,5 @@
 import type { Credentials } from '../google/google-apis.js'
-import type { OauthState, ProviderConfig } from '@prisma/client'
+import type { OauthState, ProviderConfig } from '../../generated/prisma/client.js'
 import { prisma } from '../../config/prisma.js'
 import { syncGoogleDriveInBackground } from '../google/drive-sync.js'
 import { accountLabel } from '../../utils/account-label.js'

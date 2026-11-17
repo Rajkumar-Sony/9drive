@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useParams } from 'react-router-dom'
 import { Download, ExternalLink, FileArchive, FileText, ImageIcon, Play, Table2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
-import { getApiUrl, apiFetch, formatBytes, formatDate } from '@/lib/api'
+import { getApiUrl, apiFetch, ApiError, formatBytes, formatDate } from '@/lib/api'
 import { createPlyr, ensurePlyr } from '@/lib/plyr'
 import { getPreviewKind, isSpreadsheetMimeType, officeViewerUrl } from '@/lib/preview'
 
-type PublicFile = { name: string; mimeType: string; sizeBytes: string; createdAt: string }
+type PublicFile = { name: string; mimeType: string; sizeBytes: string; createdAt: string; passwordProtected?: boolean }
 
 function fileIcon(file: PublicFile, kind: ReturnType<typeof getPreviewKind>) {
   if (kind === 'image') return <ImageIcon className="h-4 w-4" strokeWidth={1.5} />
@@ -32,6 +32,10 @@ export function PublicFilePage({ embed = false }: { embed?: boolean }) {
   const { token } = useParams()
   const [file, setFile] = useState<PublicFile | null>(null)
   const [failed, setFailed] = useState(false)
+  const [locked, setLocked] = useState(false)
+  const [password, setPassword] = useState('')
+  const [unlockError, setUnlockError] = useState('')
+  const [unlocking, setUnlocking] = useState(false)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const previewUrl = `${getApiUrl()}/public/files/${token}/preview`
   const downloadUrl = `${getApiUrl()}/public/files/${token}/download`
@@ -39,9 +43,12 @@ export function PublicFilePage({ embed = false }: { embed?: boolean }) {
 
   useEffect(() => {
     setFailed(false)
-    apiFetch<{ file: PublicFile }>(`/public/files/${token}`, { skipAuth: true })
-      .then((data) => setFile(data.file))
-      .catch(() => {
+    setFile(null)
+    setLocked(false)
+    apiFetch<{ file: PublicFile }>(`/public/files/${token}`, { skipAuth: true, credentials: 'include' })
+      .then((data) => { setFile(data.file); setLocked(false) })
+      .catch((error: unknown) => {
+        if (error instanceof ApiError && error.code === 'SHARE_PASSWORD_REQUIRED') { setLocked(true); return }
         setFile(null)
         setFailed(true)
       })
@@ -70,6 +77,26 @@ export function PublicFilePage({ embed = false }: { embed?: boolean }) {
     }
   }, [kind, previewUrl])
 
+  async function submitPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!token || unlocking) return
+    setUnlocking(true)
+    setUnlockError('')
+    try {
+      await apiFetch(`/public/files/${token}/unlock`, { method: 'POST', skipAuth: true, credentials: 'include', body: JSON.stringify({ password }) })
+      const data = await apiFetch<{ file: PublicFile }>(`/public/files/${token}`, { skipAuth: true, credentials: 'include' })
+      setFile({ ...data.file, passwordProtected: true })
+      setLocked(false)
+      setPassword('')
+    } catch (error) {
+      setUnlockError(error instanceof Error ? error.message : 'Could not unlock this file.')
+    } finally {
+      setUnlocking(false)
+    }
+  }
+
+  if (locked) return <main className="flex min-h-screen items-center justify-center bg-surface p-6 text-text"><form onSubmit={submitPassword} className="grid w-full max-w-sm gap-4 rounded-xl border border-border bg-bg p-6"><h1 className="text-lg font-semibold">Password-protected file</h1><p className="text-sm text-muted">Enter the password provided by the person who shared this file.</p><label className="grid gap-1 text-sm">Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required className="rounded-lg border border-border bg-surface p-2" /></label>{unlockError ? <p role="alert" className="text-sm text-danger">{unlockError}</p> : null}<Button type="submit" disabled={unlocking}>{unlocking ? 'Unlocking…' : 'Unlock file'}</Button></form></main>
+
   if (failed) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-surface p-6">
@@ -87,7 +114,8 @@ export function PublicFilePage({ embed = false }: { embed?: boolean }) {
       {kind === 'image' ? <img src={previewUrl} alt={file.name} className="max-h-full max-w-full object-contain" /> : null}
       {kind === 'video' ? <div className="shared-video-shell"><video ref={videoRef} controls playsInline preload="metadata"><source src={previewUrl} type={file.mimeType} /></video></div> : null}
       {kind === 'document' ? <iframe src={previewUrl} title={file.name} className="h-full w-full border-0 bg-bg" /> : null}
-      {kind === 'office' ? <iframe src={officeViewerUrl(previewUrl)} title={file.name} className="h-full w-full border-0 bg-bg" /> : null}
+      {kind === 'office' && !file.passwordProtected ? <iframe src={officeViewerUrl(previewUrl)} title={file.name} className="h-full w-full border-0 bg-bg" /> : null}
+      {kind === 'office' && file.passwordProtected ? <UnsupportedPreview file={file} downloadUrl={downloadUrl} /> : null}
       {!kind ? <UnsupportedPreview file={file} downloadUrl={downloadUrl} /> : null}
     </div>
   )

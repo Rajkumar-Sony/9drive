@@ -11,6 +11,7 @@ import { encryptText, hashToken, randomToken } from '../../utils/crypto.js'
 import { completeGoogleLogin } from '../auth/google-login.js'
 import { createOAuthClient, syncGoogleQuota } from '../google/google.service.js'
 import { assertSafeS3Endpoint, syncS3Quota, testS3Connection } from '../s3/s3.service.js'
+import { storageProvider } from '../storage-providers/provider.js'
 import { oauthClientSchema, oauthReturnUrl } from '../../utils/oauth-return.js'
 
 export const connectedAccountRouter = Router()
@@ -27,8 +28,7 @@ const s3ConnectSchema = z.object({
 })
 
 async function syncQuotaForAccount(account: { id: string; provider: string }) {
-  if (account.provider === 's3') return syncS3Quota(account.id)
-  return syncGoogleQuota(account.id)
+  return storageProvider(account.provider).syncQuota(account.id)
 }
 
 connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next) => {

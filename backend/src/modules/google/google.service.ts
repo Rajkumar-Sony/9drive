@@ -1,5 +1,5 @@
 import { google } from './google-apis.js'
-import type { ConnectedAccount, Folder, ProviderConfig } from '@prisma/client'
+import type { ConnectedAccount, Folder, ProviderConfig } from '../../generated/prisma/client.js'
 import { prisma } from '../../config/prisma.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 import { HttpError } from '../../middleware/error.middleware.js'

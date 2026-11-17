@@ -26,6 +26,7 @@ type Share = {
   url: string | null
   createdAt: string
   expiresAt: string | null
+  passwordProtected: boolean
   file: { id: string; name: string; mimeType: string }
 }
 
@@ -143,6 +144,7 @@ export function SharedPage() {
                   <li key={share.id} className="flex min-h-12 flex-wrap items-center gap-x-3 gap-y-1 px-2 py-1.5 hover:bg-hover">
                     <FileIcon kind={kindOf(share.file.mimeType)} />
                     <span className="min-w-0 flex-1 basis-40 truncate text-[13px] font-medium text-text" title={share.file.name}>{share.file.name}</span>
+                    {share.passwordProtected ? <span className="rounded-md border border-border px-2 py-0.5 text-[11px] text-muted">Password</span> : null}
                     <button
                       type="button"
                       onClick={() => copyLink(share)}

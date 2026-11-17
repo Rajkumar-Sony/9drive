@@ -1,5 +1,5 @@
 import { google, type drive_v3 } from './google-apis.js'
-import type { ConnectedAccount, Prisma } from '@prisma/client'
+import type { ConnectedAccount, Prisma } from '../../generated/prisma/client.js'
 import { prisma } from '../../config/prisma.js'
 import { accountLabel } from '../../utils/account-label.js'
 import { googleDownloadExportMimeTypes } from '../files/stream-google-file.js'

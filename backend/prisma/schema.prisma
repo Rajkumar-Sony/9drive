@@ -1,10 +1,11 @@
 generator client {
-  provider = "prisma-client-js"
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
 }
 
 datasource db {
   provider = "mysql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -252,6 +253,8 @@ model FileShare {
   tokenHash String    @unique @map("token_hash") @db.VarChar(255)
   enabled   Boolean   @default(true)
   expiresAt DateTime? @map("expires_at")
+  passwordHash String? @map("password_hash") @db.Text
+  passwordVersion Int @default(0) @map("password_version")
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
   file      File      @relation(fields: [fileId], references: [id], onDelete: Cascade)
@@ -262,6 +265,15 @@ model FileShare {
   @@index([userId, enabled, createdAt])
   @@index([fileId, userId, enabled, createdAt])
   @@map("file_shares")
+}
+
+model SharePasswordAttempt {
+  keyHash String @id @map("key_hash") @db.Char(64)
+  count Int @default(0)
+  resetAt DateTime @map("reset_at")
+
+  @@index([resetAt])
+  @@map("share_password_attempts")
 }
 
 model FilePreviewToken {

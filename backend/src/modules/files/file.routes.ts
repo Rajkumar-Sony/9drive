@@ -5,16 +5,18 @@ import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { hashToken, randomToken } from '../../utils/crypto.js'
 import { shareExpiresAt } from '../../utils/share-expiry.js'
-import type { ConnectedAccount, File, Folder } from '@prisma/client'
+import { hashPassword } from '../../utils/password.js'
+import type { ConnectedAccount, File, Folder } from '../../generated/prisma/client.js'
 import { applyDriveChange, driveParentForFolder, getAuthedGoogleClient, moveGoogleFile, syncGoogleQuota } from '../google/google.service.js'
 import { syncGoogleDrive } from '../google/drive-sync.js'
 import { deleteS3Object, syncS3Quota, createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
 import { streamProviderFile } from './stream-file.js'
+import { storageProvider } from '../storage-providers/provider.js'
 import { newShareToken, readShareToken, shareUrl } from './share-token.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders, withExtension } from './stream-google-file.js'
 import { GetObjectCommand } from '@aws-sdk/client-s3'
 import { Readable } from 'node:stream'
-import { ZipArchive } from 'archiver'
+import ZipStream from 'zip-stream'
 import { createAuditLog } from '../../utils/audit.js'
 import { env } from '../../config/env.js'
 import { mayHaveThumbnail, thumbnailPath, verifyThumbnailSignature } from '../../utils/thumbnail.js'
@@ -146,7 +148,10 @@ fileRouter.get('/', async (req: AuthRequest, res, next) => {
 })
 
 const batchFileSchema = z.object({ fileIds: z.array(z.string().min(1)).min(1).max(100) })
-const shareBodySchema = z.object({ expiresIn: z.enum(['never', '1d', '7d', '30d']).optional() })
+const shareBodySchema = z.object({
+  expiresIn: z.enum(['never', '1d', '7d', '30d']).optional(),
+  password: z.union([z.string().min(12).max(128), z.null()]).optional(),
+})
 
 // Mirrors an in-app move on Drive so `POST /files/sync-google` doesn't undo it. Only possible when
 // the target folder has a Drive mirror on the file's account (or is the root `oneconnect` folder);
@@ -262,13 +267,7 @@ fileRouter.delete('/batch/permanent', async (req: AuthRequest, res, next) => {
 
     for (const file of files) {
       try {
-        if (file.provider === 's3') {
-          await deleteS3Object(file)
-        } else {
-          const auth = await getAuthedGoogleClient(file.connectedAccount)
-          const drive = google.drive({ version: 'v3', auth })
-          await drive.files.delete({ fileId: file.providerFileId })
-        }
+        await storageProvider(file.provider).deleteFile(file)
         deletedIds.push(file.id)
         syncedAccountIds.add(file.connectedAccountId)
         await createAuditLog(req.user!.id, 'PERMANENT_DELETE_FILE', 'file', file.id, { name: file.name })
@@ -285,11 +284,7 @@ fileRouter.delete('/batch/permanent', async (req: AuthRequest, res, next) => {
 
     for (const accountId of syncedAccountIds) {
       const account = files.find((file) => file.connectedAccountId === accountId)?.connectedAccount
-      if (account?.provider === 's3') {
-        await syncS3Quota(accountId).catch(() => undefined)
-      } else {
-        await syncGoogleQuota(accountId).catch(() => undefined)
-      }
+      if (account) await storageProvider(account.provider).syncQuota(accountId).catch(() => undefined)
     }
 
     if (deletedIds.length === 0 && failed.length > 0) {
@@ -317,6 +312,7 @@ fileRouter.get('/shared-links', async (req: AuthRequest, res, next) => {
           url,
           createdAt: share.createdAt.toISOString(),
           expiresAt: share.expiresAt?.toISOString() ?? null,
+          passwordProtected: Boolean(share.passwordHash),
           file: { ...share.file, sizeBytes: share.file.sizeBytes.toString() },
         }
       })
@@ -399,16 +395,20 @@ fileRouter.post('/:id/share', async (req: AuthRequest, res, next) => {
       const issued = newShareToken()
       token = issued.token
       expiresAt = body.expiresIn ? shareExpiresAt(body.expiresIn) : (activeShare?.expiresAt ?? null)
-      const share = await prisma.fileShare.create({ data: { fileId: file.id, userId: req.user!.id, ...issued.data, expiresAt } })
+      const passwordHash = typeof body.password === 'string' ? await hashPassword(body.password) : body.password === null ? null : activeShare?.passwordHash ?? null
+      const share = await prisma.fileShare.create({ data: { fileId: file.id, userId: req.user!.id, ...issued.data, expiresAt, passwordHash } })
       shareId = share.id
       await createAuditLog(req.user!.id, 'CREATE_SHARE_LINK', 'file', file.id, { name: file.name, expiresAt: expiresAt?.toISOString() ?? null })
-    } else if (body.expiresIn) {
-      expiresAt = shareExpiresAt(body.expiresIn)
-      await prisma.fileShare.update({ where: { id: existingShare.id }, data: { expiresAt } })
-      await createAuditLog(req.user!.id, 'UPDATE_SHARE_LINK', 'file', file.id, { name: file.name, expiresAt: expiresAt?.toISOString() ?? null })
+    } else if (body.expiresIn || body.password !== undefined) {
+      if (body.expiresIn) expiresAt = shareExpiresAt(body.expiresIn)
+      await prisma.fileShare.update({ where: { id: existingShare.id }, data: {
+        ...(body.expiresIn ? { expiresAt } : {}),
+        ...(body.password !== undefined ? { passwordHash: body.password === null ? null : await hashPassword(body.password), passwordVersion: { increment: 1 } } : {}),
+      } })
+      await createAuditLog(req.user!.id, 'UPDATE_SHARE_LINK', 'file', file.id, { name: file.name, expiresAt: expiresAt?.toISOString() ?? null, passwordChanged: body.password !== undefined })
     }
 
-    return res.status(existingShare ? 200 : 201).json({ url: shareUrl(token!), shareId, expiresAt: expiresAt?.toISOString() ?? null })
+    return res.status(existingShare ? 200 : 201).json({ url: shareUrl(token!), shareId, expiresAt: expiresAt?.toISOString() ?? null, passwordProtected: body.password === undefined ? Boolean(existingShare?.passwordHash ?? activeShare?.passwordHash) : body.password !== null })
   } catch (error) {
     return next(error)
   }
@@ -514,8 +514,9 @@ fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
     res.setHeader('Content-Type', 'application/zip')
     res.setHeader('Content-Disposition', 'attachment; filename="oneconnect-download.zip"')
 
-    const archive = new ZipArchive({ zlib: { level: 9 } })
+    const archive = new ZipStream({ zlib: { level: 9 } })
     let aborted = false
+    let currentStream: Readable | null = null
     let markStopped: () => void = () => undefined
     const stopped = new Promise<void>((resolve) => { markStopped = resolve })
     archive.on('error', (err: Error) => {
@@ -528,7 +529,8 @@ fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
       if (!res.writableFinished) {
         aborted = true
         markStopped()
-        archive.abort()
+        currentStream?.destroy()
+        archive.destroy()
       }
     })
     archive.pipe(res)
@@ -577,16 +579,23 @@ fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
         opened.stream.destroy()
         return
       }
-      const entryWritten = new Promise<void>((resolve) => archive.once('entry', () => resolve()))
-      archive.append(opened.stream, { name: uniqueName(opened.fileName.replace(/[\\/]+/g, '-')) })
+      currentStream = opened.stream
+      opened.stream.once('error', (err) => archive.destroy(err))
+      const entryWritten = new Promise<void>((resolve, reject) => {
+        archive.entry(opened.stream, { name: uniqueName(opened.fileName.replace(/[\\/]+/g, '-')) }, (err) => err ? reject(err) : resolve())
+      })
       await Promise.race([entryWritten, stopped])
+      currentStream = null
     }
 
     if (aborted) return
     if (missing.length > 0) {
-      archive.append(`These files could not be downloaded and are not in this archive:\n\n${missing.join('\n')}\n`, { name: uniqueName('MISSING.txt') })
+      const reportWritten = new Promise<void>((resolve, reject) => {
+        archive.entry(`These files could not be downloaded and are not in this archive:\n\n${missing.join('\n')}\n`, { name: uniqueName('MISSING.txt') }, (err) => err ? reject(err) : resolve())
+      })
+      await Promise.race([reportWritten, stopped])
     }
-    await archive.finalize()
+    if (!aborted) archive.finalize()
   } catch (error) {
     return next(error)
   }

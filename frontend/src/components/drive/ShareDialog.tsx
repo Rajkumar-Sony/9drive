@@ -31,6 +31,9 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
   const fileId = file?.id ?? null
   const [url, setUrl] = useState<string | null>(null)
   const [expiry, setExpiry] = useState<Expiry>('never')
+  const [passwordProtected, setPasswordProtected] = useState(false)
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState('')
@@ -51,19 +54,23 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
     let cancelled = false
     setUrl(null)
     setExpiry('never')
+    setPasswordProtected(false)
+    setNewPassword('')
+    setConfirmPassword('')
     setCopied(false)
     setError('')
     setPeople([])
     setEmail('')
     setRole('viewer')
     setInviteError('')
-    apiFetch<{ shares: { url: string | null; expiresAt: string | null; file: { id: string } }[] }>('/files/shared-links')
+    apiFetch<{ shares: { url: string | null; expiresAt: string | null; passwordProtected: boolean; file: { id: string } }[] }>('/files/shared-links')
       .then((data) => {
         if (cancelled) return
         const share = data.shares.find((item) => item.file.id === fileId)
         if (share?.url) {
           setUrl(share.url)
           setExpiry(expiryFor(share.expiresAt))
+          setPasswordProtected(Boolean(share.passwordProtected))
         }
       })
       .catch((e) => !cancelled && setError(e instanceof Error ? e.message : 'Failed to load sharing settings'))
@@ -73,14 +80,17 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
     }
   }, [open, fileId])
 
-  async function createOrUpdateLink(nextExpiry: Expiry) {
+  async function createOrUpdateLink(nextExpiry: Expiry | undefined, password?: string | null) {
     if (!fileId) return
     setBusy(true)
     setError('')
     try {
-      const data = await apiFetch<{ url: string }>(`/files/${fileId}/share`, { method: 'POST', body: JSON.stringify({ expiresIn: nextExpiry }) })
+      const data = await apiFetch<{ url: string; passwordProtected: boolean }>(`/files/${fileId}/share`, { method: 'POST', body: JSON.stringify({ ...(nextExpiry ? { expiresIn: nextExpiry } : {}), ...(password !== undefined ? { password } : {}) }) })
       setUrl(data.url)
-      setExpiry(nextExpiry)
+      if (nextExpiry) setExpiry(nextExpiry)
+      setPasswordProtected(data.passwordProtected)
+      setNewPassword('')
+      setConfirmPassword('')
       onChanged?.()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to update the link')
@@ -97,6 +107,7 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
       try {
         await apiFetch(`/files/${fileId}/share`, { method: 'DELETE' })
         setUrl(null)
+        setPasswordProtected(false)
         setCopied(false)
         onChanged?.()
       } catch (e) {
@@ -106,7 +117,14 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
       }
       return
     }
-    await createOrUpdateLink(expiry)
+    if (newPassword && (newPassword.length < 12 || newPassword !== confirmPassword)) { setError('Use at least 12 characters and matching passwords.'); return }
+    await createOrUpdateLink(expiry, newPassword || undefined)
+  }
+
+  async function updatePassword(password: string | null) {
+    if (!fileId || !url) return
+    if (password !== null && (password.length < 12 || password !== confirmPassword)) { setError('Use at least 12 characters and matching passwords.'); return }
+    await createOrUpdateLink(undefined, password)
   }
 
   async function copy() {
@@ -155,7 +173,7 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="text-[13px] font-medium text-text">Public link</p>
-              <p className="text-[12px] text-muted">Anyone with the link can view, no Google sign-in needed.</p>
+              <p className="text-[12px] text-muted">{passwordProtected ? 'Anyone with the link and password can view.' : 'Anyone with the link can view, no Google sign-in needed.'}</p>
             </div>
             <Switch checked={url !== null} onChange={(on) => { if (!busy) void toggleLink(on) }} label="Public link" />
           </div>
@@ -176,6 +194,13 @@ export function ShareDialog({ file, open, onClose, onChanged }: { file: FileItem
               </label>
             </>
           ) : null}
+          <div className="grid gap-2 rounded-lg border border-border p-3">
+            <p className="text-[13px] font-medium text-text">Password protection {passwordProtected ? '· On' : '· Off'}</p>
+            <p className="text-[12px] text-muted">Optional. Share the password separately from the link. At least 12 characters.</p>
+            <Input type="password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder={passwordProtected ? 'New password' : 'Set a password'} aria-label="Share password" />
+            <Input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Confirm password" aria-label="Confirm share password" />
+            {url !== null ? <div className="flex gap-2"><Button variant="secondary" disabled={busy || !newPassword} onClick={() => void updatePassword(newPassword)}>{passwordProtected ? 'Change password' : 'Protect link'}</Button>{passwordProtected ? <Button variant="ghost" disabled={busy} onClick={() => void updatePassword(null)}>Remove password</Button> : null}</div> : null}
+          </div>
           {error ? <p role="alert" className="text-[13px] text-danger">{error}</p> : null}
         </section>
 

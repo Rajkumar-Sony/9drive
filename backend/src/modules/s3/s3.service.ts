@@ -1,7 +1,7 @@
 import { AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CreateMultipartUploadCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, ListObjectsV2Command, ListPartsCommand, S3Client, UploadPartCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { Upload } from '@aws-sdk/lib-storage'
-import type { ConnectedAccount, File, S3StorageConfig } from '@prisma/client'
+import type { ConnectedAccount, File, S3StorageConfig } from '../../generated/prisma/client.js'
 import type { Response } from 'express'
 import type { Readable } from 'node:stream'
 import { lookup } from 'node:dns/promises'

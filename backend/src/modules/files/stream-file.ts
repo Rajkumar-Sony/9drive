@@ -1,12 +1,10 @@
-import type { ConnectedAccount, File } from '@prisma/client'
+import type { ConnectedAccount, File } from '../../generated/prisma/client.js'
 import type { Response } from 'express'
-import { streamGoogleFile } from './stream-google-file.js'
-import { streamS3File } from '../s3/s3.service.js'
+import { storageProvider } from '../storage-providers/provider.js'
 
 type FileWithAccount = File & { connectedAccount: ConnectedAccount }
 type StreamOptions = { disposition?: 'inline' | 'attachment' }
 
 export function streamProviderFile(file: FileWithAccount, range: string | undefined, res: Response, options: StreamOptions = {}) {
-  if (file.provider === 's3') return streamS3File(file, range, res, options)
-  return streamGoogleFile(file, range, res, options)
+  return storageProvider(file.provider).streamFile(file, range, res, options)
 }

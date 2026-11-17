@@ -22,6 +22,16 @@ export function getWebUrl() {
 
 type ApiOptions = RequestInit & { skipAuth?: boolean; retry?: boolean }
 
+export class ApiError extends Error {
+  code: string
+  status: number
+  constructor(message: string, code: string, status: number) {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+
 export async function refreshAccessToken() {
   const refreshToken = getRefreshToken()
   if (!refreshToken) return false
@@ -72,7 +82,7 @@ export async function apiFetch<T>(path: string, options: ApiOptions = {}): Promi
     // Only a request made with the session can show the session is gone (a failed login or
     // handoff exchange says nothing about it).
     if (response.status === 401 && !options.skipAuth) clearAuthSession()
-    throw new Error(error.message ?? 'Request failed')
+    throw new ApiError(error.message ?? 'Request failed', error.code ?? 'REQUEST_FAILED', response.status)
   }
 
   return response.json() as Promise<T>

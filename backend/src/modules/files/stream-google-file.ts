@@ -1,6 +1,6 @@
 import type { Response } from 'express'
 import type { ReadableStream as WebReadableStream } from 'node:stream/web'
-import type { ConnectedAccount, File } from '@prisma/client'
+import type { ConnectedAccount, File } from '../../generated/prisma/client.js'
 import { getAuthedGoogleClient } from '../google/google.service.js'
 import { pipeToResponse, setFileResponseHeaders } from './file-response.js'
 

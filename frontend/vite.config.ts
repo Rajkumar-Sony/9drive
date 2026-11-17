@@ -1,7 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { VitePWA } from 'vite-plugin-pwa'
+import { serwist } from '@serwist/vite'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const projectDir = path.dirname(fileURLToPath(import.meta.url))
 
 // `--mode desktop` builds the app for the Tauri shell (desktop/): no PWA/service worker, its own
 // output folder, and VITE_DESKTOP=1 from .env.desktop.
@@ -12,37 +15,20 @@ export default defineConfig(({ mode }) => ({
   clearScreen: mode === 'desktop' ? false : undefined,
   plugins: [
     react(),
-    mode !== 'desktop' && VitePWA({
-      registerType: 'autoUpdate',
-      includeAssets: ['favicon.svg', 'favicon.ico', 'apple-touch-icon.png'],
-      manifest: {
-        name: 'oneconnect',
-        short_name: 'oneconnect',
-        description: 'Google Drive storage gateway for files, folders, sharing, and quota tracking.',
-        theme_color: '#2563eb',
-        background_color: '#ffffff',
-        display: 'standalone',
-        start_url: '/all-files',
-        scope: '/',
-        orientation: 'portrait-primary',
-        icons: [
-          { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
-          { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
-          { src: '/maskable-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
-        ],
-      },
-      workbox: {
-        // Production serves the backend under /api (nginx proxy); the bare prefixes cover dev/custom VITE_API_URL setups.
-        navigateFallbackDenylist: [/^\/api\//, /^\/(auth|api-keys|audit-logs|connected-accounts|files|folders|invites|provider-configs|public|storage|system|uploads)(\/|$)/],
-        globPatterns: ['**/*.{js,css,html,svg,ico,png,webp,woff2}'],
-      },
+    mode !== 'desktop' && serwist({
+      swSrc: 'src/sw.ts',
+      swDest: 'sw.js',
+      globDirectory: 'dist',
+      injectionPoint: 'self.__SW_MANIFEST',
+      rollupFormat: 'iife',
+      globPatterns: ['**/*.{js,css,html,svg,ico,png,webp,woff2,webmanifest}'],
     }),
   ],
   resolve: {
     alias: [
       // Web builds get a stub, so no Tauri code ships to browsers.
-      { find: /^@\/lib\/desktop$/, replacement: path.resolve(__dirname, mode === 'desktop' ? './src/lib/desktop.ts' : './src/lib/desktop-web.ts') },
-      { find: '@', replacement: path.resolve(__dirname, './src') },
+      { find: /^@\/lib\/desktop$/, replacement: path.resolve(projectDir, mode === 'desktop' ? './src/lib/desktop.ts' : './src/lib/desktop-web.ts') },
+      { find: '@', replacement: path.resolve(projectDir, './src') },
     ],
   },
 }))

@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { google } from '../google/google-apis.js'
 import { z } from 'zod'
-import type { Folder } from '@prisma/client'
+import type { Folder } from '../../generated/prisma/client.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { HttpError } from '../../middleware/error.middleware.js'
