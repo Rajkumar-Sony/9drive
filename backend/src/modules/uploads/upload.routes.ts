@@ -101,7 +101,10 @@ async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByA
 
   const eligible = fresh
     .map((account) => ({ account, availableBytes: account.storageAccount?.availableBytes === null || account.storageAccount?.availableBytes === undefined ? null : account.storageAccount.availableBytes - (reservedBytesByAccount.get(account.id) ?? 0n) }))
-    .filter(({ availableBytes }) => availableBytes === null || availableBytes >= sizeBytes)
+    .filter(({ account, availableBytes }) => {
+      const maximum = storageProvider(account.provider).capabilities.maxUploadBytes
+      return (maximum === null || sizeBytes <= maximum) && (availableBytes === null || availableBytes >= sizeBytes)
+    })
 
   if (eligible.length === 0) return null
 

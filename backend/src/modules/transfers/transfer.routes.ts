@@ -66,6 +66,8 @@ transferRouter.post('/plans/:id/run', async (req: AuthRequest, res, next) => {
     const existingDestinations = new Set(destinationFiles.map((file) => file.providerFileId))
     const versions = new Map(mappings.filter((mapping) => existingDestinations.has(mapping.destinationProviderId)).map((mapping) => [mapping.sourceProviderId, mapping.sourceVersion]))
     const pending = files.filter((file) => versions.get(file.providerFileId) !== file.updatedAt.toISOString())
+    const maxUpload = storageProvider(destination.provider).capabilities.maxUploadBytes
+    if (maxUpload !== null && pending.some((file) => file.sizeBytes > maxUpload)) return res.status(409).json({ code: 'PROVIDER_FILE_TOO_LARGE', message: 'A source file exceeds the destination provider limit.' })
     const job = await prisma.transferJob.create({ data: { userId: req.user!.id, kind: 'replicate', replicationPlanId: plan.id, sourceConnectedAccountId: plan.sourceConnectedAccountId, destinationConnectedAccountId: plan.destinationConnectedAccountId, status: pending.length ? 'queued' : 'completed', completedAt: pending.length ? null : new Date(), totalItems: pending.length, items: { create: pending.map((file) => ({ sourceFileId: file.id, sourceProviderId: file.providerFileId, destinationName: file.name, sizeBytes: file.sizeBytes })) } } })
     await prisma.replicationPlan.update({ where: { id: plan.id }, data: { lastRunAt: new Date() } })
     return res.status(201).json({ job: { ...job, fencingToken: job.fencingToken.toString() } })
@@ -85,6 +87,8 @@ transferRouter.post('/', async (req: AuthRequest, res, next) => {
     const ids = [...new Set(body.fileIds)]
     const files = await prisma.file.findMany({ where: { id: { in: ids }, userId: req.user!.id, connectedAccountId: source.id, status: 'active' } })
     if (files.length !== ids.length) return res.status(400).json({ code: 'FILES_NOT_FOUND', message: 'Every selected file must belong to the source account.' })
+    const maxUpload = storageProvider(destination.provider).capabilities.maxUploadBytes
+    if (maxUpload !== null && files.some((file) => file.sizeBytes > maxUpload)) return res.status(400).json({ code: 'PROVIDER_FILE_TOO_LARGE', message: 'A source file exceeds the destination provider limit.' })
     const existingNames = new Set((await prisma.file.findMany({ where: { userId: req.user!.id, connectedAccountId: destination.id, status: 'active' }, select: { name: true } })).map((file) => file.name))
     const items = files.map((file) => {
       const name = keepBothName(file.name, existingNames)

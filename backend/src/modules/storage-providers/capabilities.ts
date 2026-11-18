@@ -31,7 +31,7 @@ const disabled = {
 
 export const STORAGE_PROVIDER_CAPABILITIES: Record<StorageProviderId, StorageProviderCapabilities> = {
   google_drive: {
-    maxUploadBytes: null, ...disabled, quota: true, upload: true, download: true,
+    maxUploadBytes: 5_000_000_000_000n, ...disabled, quota: true, upload: true, download: true,
     list: true, createFolder: true, delete: true, resumableUpload: true,
     rangeDownload: true, share: true, copy: true, move: true,
   },
@@ -39,7 +39,7 @@ export const STORAGE_PROVIDER_CAPABILITIES: Record<StorageProviderId, StoragePro
     maxUploadBytes: null, ...disabled, quota: true, upload: true, download: true,
     list: true, delete: true, multipartUpload: true, resumableUpload: true, rangeDownload: true, copy: true, move: true,
   },
-  onedrive: { maxUploadBytes: null, ...disabled, quota: true, upload: true, download: true, delete: true, resumableUpload: true, copy: true, move: true },
+  onedrive: { maxUploadBytes: 250_000_000_000n, ...disabled, quota: true, upload: true, download: true, delete: true, resumableUpload: true, copy: true, move: true },
   telegram_bot: { maxUploadBytes: null, ...disabled },
   telegram_mtproto: { maxUploadBytes: null, ...disabled },
 }

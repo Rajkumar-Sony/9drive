@@ -11,7 +11,7 @@ test('storage providers declare upload limits and operation capabilities', async
   const google = storageProvider('google_drive')
   const s3 = storageProvider('s3')
 
-  assert.equal(google.capabilities.maxUploadBytes, null)
+  assert.equal(google.capabilities.maxUploadBytes, 5_000_000_000_000n)
   assert.equal(google.capabilities.resumableUpload, true)
   assert.equal(google.capabilities.multipartUpload, false)
   assert.equal(google.capabilities.createFolder, true)
@@ -21,6 +21,8 @@ test('storage providers declare upload limits and operation capabilities', async
   assert.equal(s3.capabilities.multipartUpload, true)
   assert.equal(s3.capabilities.createFolder, false)
   assert.equal(s3.capabilities.download, true)
+  const oneDrive = storageProvider('onedrive')
+  assert.equal(oneDrive.capabilities.maxUploadBytes, 250_000_000_000n)
 })
 
 test('capability guard rejects unsupported provider operations', async () => {
