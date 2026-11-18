@@ -9,6 +9,7 @@ import { hashPassword } from '../../utils/password.js'
 import type { ConnectedAccount, File, Folder } from '../../generated/prisma/client.js'
 import { applyDriveChange, driveParentForFolder, getAuthedGoogleClient, moveGoogleFile, syncGoogleQuota } from '../google/google.service.js'
 import { syncGoogleDrive } from '../google/drive-sync.js'
+import { syncOneDriveFiles } from '../onedrive/onedrive-sync.js'
 import { deleteS3Object, syncS3Quota, createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
 import { streamProviderFile } from './stream-file.js'
 import { storageProvider } from '../storage-providers/provider.js'
@@ -67,6 +68,8 @@ fileRouter.get('/thumbnail/:id', async (req, res, next) => {
       if (object.ContentLength !== undefined) res.setHeader('Content-Length', String(object.ContentLength))
       return pipeToResponse(object.Body as Readable, res)
     }
+
+    if (file.provider !== 'google_drive') return notFound()
 
     const auth = await getAuthedGoogleClient(file.connectedAccount)
     const metadata = await google.drive({ version: 'v3', auth }).files.get({ fileId: file.providerFileId, fields: 'thumbnailLink' }).catch(() => null)
@@ -342,6 +345,19 @@ fileRouter.post('/sync-google', async (req: AuthRequest, res, next) => {
   } catch (error) {
     return next(error)
   }
+})
+
+fileRouter.post('/sync-onedrive', async (req: AuthRequest, res, next) => {
+  try {
+    const body = z.object({ connectedAccountId: z.string().uuid().optional() }).parse(req.body ?? {})
+    const accounts = await prisma.connectedAccount.findMany({ where: { userId: req.user!.id, provider: 'onedrive', status: 'connected', ...(body.connectedAccountId ? { id: body.connectedAccountId } : {}) }, select: { id: true } })
+    const work = Promise.all(accounts.map((account) => syncOneDriveFiles(account.id, req.user!.id).then((result) => ({ accountId: account.id, ...result })).catch((error) => ({ accountId: account.id, changed: 0, error: error instanceof Error ? error.message : 'Sync failed' }))))
+    let timer: NodeJS.Timeout | undefined
+    const results = await Promise.race([work, new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 45_000) })])
+    clearTimeout(timer)
+    if (!results) return res.status(202).json({ status: 'running', results: [] })
+    return res.json({ status: 'ok', results })
+  } catch (error) { return next(error) }
 })
 
 fileRouter.get('/:id', async (req: AuthRequest, res, next) => {

@@ -14,6 +14,7 @@ import { assertSafeS3Endpoint, syncS3Quota, testS3Connection } from '../s3/s3.se
 import { storageProvider } from '../storage-providers/provider.js'
 import { oauthClientSchema, oauthReturnUrl } from '../../utils/oauth-return.js'
 import { exchangeOneDriveCode, oneDriveConnectUrl, syncOneDriveQuota } from '../onedrive/onedrive.service.js'
+import { syncOneDriveFiles } from '../onedrive/onedrive-sync.js'
 import { decryptText } from '../../utils/crypto.js'
 
 export const connectedAccountRouter = Router()
@@ -203,6 +204,7 @@ connectedAccountRouter.get('/onedrive/callback', async (req, res) => {
       update: { providerConfigId: oauthState.providerConfigId, email: profile.mail || profile.userPrincipalName || `${profile.id}@onedrive`, displayName: profile.displayName, accessTokenEncrypted: encryptText(tokens.access_token), refreshTokenEncrypted: encryptText(tokens.refresh_token), tokenExpiresAt: new Date(Date.now() + tokens.expires_in * 1000), scopes: oauthState.providerConfig.scopes as string[], status: 'connected' },
     })
     await syncOneDriveQuota(account.id).catch(() => undefined)
+    void syncOneDriveFiles(account.id, account.userId).catch((error) => console.error('OneDrive file discovery failed:', error instanceof Error ? error.message : error))
     await createAuditLog(oauthState.userId, 'CONNECT_ACCOUNT', 'account', account.id, { provider: 'onedrive' })
     return res.redirect(oauthReturnUrl(env.FRONTEND_URL, oauthState.client, 'google-connected', { status: 'success', provider: 'onedrive' }))
   } catch (error) {

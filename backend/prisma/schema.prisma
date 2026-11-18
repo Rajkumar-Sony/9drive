@@ -157,6 +157,7 @@ model ConnectedAccount {
   // import ran (a full one runs at least daily). Cleared on disconnect.
   driveChangesToken     String?         @map("drive_changes_token") @db.VarChar(255)
   driveFullSyncAt       DateTime?       @map("drive_full_sync_at")
+  oneDriveDeltaLinkEncrypted String?    @map("onedrive_delta_link_encrypted") @db.Text
   scopes                Json
   status                String          @default("connected") @db.VarChar(32)
   lastError             String?         @map("last_error") @db.Text
@@ -230,6 +231,7 @@ model File {
   mimeType           String           @map("mime_type") @db.VarChar(191)
   sizeBytes          BigInt           @map("size_bytes")
   checksum           String?          @db.VarChar(191)
+  providerVersion     String?          @map("provider_version") @db.VarChar(191)
   status             String           @default("active") @db.VarChar(32)
   createdAt          DateTime         @default(now()) @map("created_at")
   updatedAt          DateTime         @updatedAt @map("updated_at")

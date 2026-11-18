@@ -363,9 +363,12 @@ export function AllFilesPage() {
     setSyncingDrive(true)
     setMessage('')
     try {
-      const response = await apiFetch<{ status: string; results: { created: number; updated: number; deleted: number; error?: string }[] }>('/files/sync-google', { method: 'POST', body: JSON.stringify({}) })
-      if (response.status === 'running') {
-        flash('Syncing a large Drive in the background. Files will appear in a few minutes.', 8000)
+      const [response, oneDrive] = await Promise.all([
+        apiFetch<{ status: string; results: { created: number; updated: number; deleted: number; error?: string }[] }>('/files/sync-google', { method: 'POST', body: JSON.stringify({}) }),
+        apiFetch<{ status: string; results: { changed: number; error?: string }[] }>('/files/sync-onedrive', { method: 'POST', body: JSON.stringify({}) }),
+      ])
+      if (response.status === 'running' || oneDrive.status === 'running') {
+        flash('Cloud files are syncing in the background. They will appear when discovery finishes.', 8000)
         return
       }
 
@@ -377,12 +380,14 @@ export function AllFilesPage() {
       }
       const accounts = response.results.length
       const failed = response.results.filter((res) => res.error).length
+      const oneDriveChanged = oneDrive.results.reduce((sum, result) => sum + result.changed, 0)
+      const oneDriveFailed = oneDrive.results.filter((result) => result.error).length
 
-      flash(`Google Drive synced. ${created} added, ${updated} updated, ${deleted} removed across ${accounts} account${accounts === 1 ? '' : 's'}.${failed ? ` ${failed} account${failed === 1 ? '' : 's'} failed to sync.` : ''}`, 6000)
+      flash(`Cloud files synced. Google Drive: ${created} added, ${updated} updated, ${deleted} removed across ${accounts} account${accounts === 1 ? '' : 's'}. OneDrive: ${oneDriveChanged} changed across ${oneDrive.results.length} account${oneDrive.results.length === 1 ? '' : 's'}.${failed + oneDriveFailed ? ` ${failed + oneDriveFailed} account${failed + oneDriveFailed === 1 ? '' : 's'} failed to sync.` : ''}`, 6000)
       await loadAll()
       window.dispatchEvent(new Event('oneconnect:storage-changed'))
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to sync Google Drive')
+      setMessage(error instanceof Error ? error.message : 'Failed to sync cloud accounts')
     } finally {
       setSyncingDrive(false)
     }
