@@ -14,7 +14,7 @@ export type NativeUpload = {
   /** Bytes per second while uploading. */
   speed?: number
 }
-export type PickedFile = { path: string; name: string; size: number }
+export type PickedFile = { path: string; name: string; size: number; relativePath?: string | null }
 export type DownloadEvent = { id: string; received: number; total: number | null; status: 'downloading' | 'done' | 'error' | 'cancelled'; error?: string | null }
 
 export async function invoke<T>(command: string, args?: Record<string, unknown>) {
@@ -29,8 +29,8 @@ export async function listen<T>(event: string, handler: (payload: T) => void): P
 
 export const uploader = {
   configure: (auth: { apiUrl: string; accessToken: string | null; refreshToken: string | null }) => invoke<void>('uploader_configure', { auth }),
-  enqueue: (paths: string[], folderId: string | null, targetAccountId: string | null) =>
-    invoke<NativeUpload[]>('uploader_enqueue', { request: { paths, folderId, targetAccountId } }),
+  enqueue: (files: PickedFile[], folderId: string | null, targetAccountId: string | null) =>
+    invoke<NativeUpload[]>('uploader_enqueue', { request: { files, folderId, targetAccountId } }),
   list: () => invoke<NativeUpload[]>('uploader_list'),
   pause: (id: string) => invoke<void>('uploader_pause', { id }),
   resume: (id: string) => invoke<void>('uploader_resume', { id }),
@@ -45,8 +45,8 @@ export function serverInfo(url: string) {
 }
 
 // Names and sizes of local files; folders and unreadable paths are left out.
-export function inspectPaths(paths: string[]) {
-  return invoke<PickedFile[]>('inspect_paths', { paths })
+export function inspectPaths(paths: string[], root?: string) {
+  return invoke<PickedFile[]>('inspect_paths', { paths, root })
 }
 
 export async function pickFiles(): Promise<PickedFile[]> {
@@ -54,6 +54,12 @@ export async function pickFiles(): Promise<PickedFile[]> {
   const selected = await open({ multiple: true, directory: false, title: 'Choose files to upload' })
   if (!selected) return []
   return inspectPaths(Array.isArray(selected) ? selected : [selected])
+}
+
+export async function pickFolder(): Promise<PickedFile[]> {
+  const { open } = await import('@tauri-apps/plugin-dialog')
+  const selected = await open({ directory: true, multiple: false, title: 'Choose folder to upload' })
+  return selected ? inspectPaths([selected]) : []
 }
 
 // Files dragged in from Finder/Explorer. (Tauri hands over paths, not browser File objects.)

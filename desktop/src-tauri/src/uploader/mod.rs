@@ -58,6 +58,7 @@ pub struct Item {
     pub mime_type: String,
     pub folder_id: Option<String>,
     pub target_account_id: Option<String>,
+    pub relative_path: Option<String>,
     pub status: Status,
     pub uploaded: u64,
     pub error: Option<String>,
@@ -335,12 +336,12 @@ impl Uploader {
     }
 }
 
-fn new_item(path: &Path, folder_id: Option<String>, target_account_id: Option<String>) -> Option<Item> {
+fn new_item(path: &Path, folder_id: Option<String>, target_account_id: Option<String>, relative_path: Option<String>) -> Option<Item> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
     }
-    let name = path.file_name()?.to_string_lossy().into_owned();
+    let name = relative_path.as_deref().and_then(|rel| Path::new(rel).file_name()).map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned());
     Some(Item {
         id: uuid::Uuid::new_v4().to_string(),
         path: path.to_path_buf(),
@@ -350,6 +351,7 @@ fn new_item(path: &Path, folder_id: Option<String>, target_account_id: Option<St
         modified_ms: modified_ms(&meta),
         folder_id,
         target_account_id,
+        relative_path,
         status: Status::Queued,
         uploaded: 0,
         error: None,
@@ -372,14 +374,18 @@ pub async fn uploader_configure(auth: Auth, uploader: State<'_, Uploader>) -> Re
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnqueueRequest {
-    paths: Vec<String>,
+    files: Vec<EnqueueFile>,
     folder_id: Option<String>,
     target_account_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnqueueFile { path: String, relative_path: Option<String> }
+
 #[tauri::command]
 pub fn uploader_enqueue(request: EnqueueRequest, uploader: State<'_, Uploader>) -> Vec<View> {
-    let added: Vec<Item> = request.paths.iter().filter_map(|p| new_item(Path::new(p), request.folder_id.clone(), request.target_account_id.clone())).collect();
+    let added: Vec<Item> = request.files.iter().filter_map(|file| new_item(Path::new(&file.path), request.folder_id.clone(), request.target_account_id.clone(), file.relative_path.clone())).collect();
     let views = added.iter().map(View::from).collect();
     {
         let mut queue = uploader.inner.queue.lock().unwrap();
@@ -460,6 +466,7 @@ mod tests {
             mime_type: "application/octet-stream".into(),
             folder_id: None,
             target_account_id: Some("acc".into()),
+            relative_path: None,
             status: Status::Waiting,
             uploaded: 4,
             error: Some("No connection".into()),

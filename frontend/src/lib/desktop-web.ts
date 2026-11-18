@@ -14,6 +14,7 @@ export const uploader: typeof Desktop.uploader = {
 export const serverInfo = unavailable as typeof Desktop.serverInfo
 export const inspectPaths = unavailable as typeof Desktop.inspectPaths
 export const pickFiles = unavailable as typeof Desktop.pickFiles
+export const pickFolder = unavailable as typeof Desktop.pickFolder
 export const onFileDrop = unavailable as typeof Desktop.onFileDrop
 export const openExternal = unavailable as typeof Desktop.openExternal
 export const chooseSavePath = unavailable as typeof Desktop.chooseSavePath

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from 'react'
 import { UploadContext, type UploadProgressFile, type UploadProgressState, type UploadProgressStatus } from '@/context/UploadContext'
-import { listen, uploader, type NativeUpload } from '@/lib/desktop'
+import { listen, uploader, type NativeUpload, type PickedFile } from '@/lib/desktop'
+import { resolveUploadFolder } from '@/lib/upload-folders'
 
 // Desktop uploads run in the native uploader (Rust): files stream from disk straight to Google Drive
 // or S3, the queue survives restarts, and dropped connections resume on their own. This provider
@@ -83,14 +84,31 @@ export function DesktopUploadProvider({ children }: { children: ReactNode }) {
 
   async function uploadPaths(paths: string[], folderId: string | null, targetAccountId?: string | null) {
     if (paths.length === 0) return
-    const added = await uploader.enqueue(paths, folderId, targetAccountId ?? null)
-    setItems((current) => {
-      const next = new Map(current)
-      for (const item of added) next.set(item.id, item)
-      return next
-    })
-    for (const item of added) statuses.current.set(item.id, item.status)
-    setOpen(true)
+    const { inspectPaths } = await import('@/lib/desktop')
+    const files = await inspectPaths(paths)
+    await uploadNativeFiles(files, folderId, targetAccountId)
+  }
+
+  async function uploadNativeFiles(files: PickedFile[], folderId: string | null, targetAccountId?: string | null) {
+    if (files.length === 0) return
+    const folderCache = new Map<string, string>()
+    const groups = new Map<string | null, PickedFile[]>()
+    for (const file of files) {
+      const destinationFolderId = await resolveUploadFolder(file.relativePath, folderId, folderCache)
+      const group = groups.get(destinationFolderId) ?? []
+      group.push(file)
+      groups.set(destinationFolderId, group)
+    }
+    for (const [destinationFolderId, group] of groups) {
+      const added = await uploader.enqueue(group, destinationFolderId, targetAccountId ?? null)
+      setItems((current) => {
+        const next = new Map(current)
+        for (const item of added) next.set(item.id, item)
+        return next
+      })
+      for (const item of added) statuses.current.set(item.id, item.status)
+      setOpen(true)
+    }
   }
 
   return (
@@ -100,6 +118,7 @@ export function DesktopUploadProvider({ children }: { children: ReactNode }) {
         setUploadProgress,
         uploadFiles: async () => { throw new Error('The desktop app uploads files by path.') },
         uploadPaths,
+        uploadNativeFiles,
         retryFailedUpload: (id) => uploader.resume(id),
         pauseUpload: (id) => uploader.pause(id),
         resumeUpload: (id) => uploader.resume(id),

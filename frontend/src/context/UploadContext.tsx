@@ -1,6 +1,8 @@
 import { createContext, useContext, useState, type ReactNode } from 'react'
 import { isDesktop } from '@/lib/runtime'
 import { DesktopUploadProvider } from '@/context/DesktopUploadProvider'
+import type { PickedFile } from '@/lib/desktop'
+import { resolveUploadFolder as resolveFolderPath } from '@/lib/upload-folders'
 import { getApiUrl, apiFetch, authedFetch, refreshAccessToken } from '@/lib/api'
 import { clearAuthSession, getAccessToken } from '@/lib/auth'
 
@@ -17,6 +19,7 @@ export type UploadContextType = {
   // Web: browser File objects. Desktop: local paths, uploaded by the native uploader.
   uploadFiles: (files: File[], folderId: string | null, targetAccountId?: string | null) => Promise<void>
   uploadPaths: (paths: string[], folderId: string | null, targetAccountId?: string | null) => Promise<void>
+  uploadNativeFiles?: (files: PickedFile[], folderId: string | null, targetAccountId?: string | null) => Promise<void>
   retryFailedUpload: (uploadId: string) => Promise<void>
   // Desktop only.
   pauseUpload?: (uploadId: string) => Promise<void>
@@ -54,25 +57,7 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
   const [resumableSessions, setResumableSessions] = useState<Record<string, ResumableSession>>({})
 
   async function resolveUploadFolder(file: File, rootFolderId: string | null, cache: Map<string, string>) {
-    const path = file.webkitRelativePath
-    if (!path) return rootFolderId
-    const segments = path.split('/')
-    if (segments.length < 2 || segments.length > 33 || segments.some((segment) => !segment || segment === '.' || segment === '..' || segment.length > 255 || /[\\\u0000-\u001f]/.test(segment))) {
-      throw new Error('Folder path is invalid or too deep.')
-    }
-    let parentId = rootFolderId
-    for (const name of segments.slice(0, -1)) {
-      const key = `${parentId ?? 'root'}/${name}`
-      const cached = cache.get(key)
-      if (cached) { parentId = cached; continue }
-      const query = parentId ? `?parentId=${encodeURIComponent(parentId)}` : ''
-      const existing = await apiFetch<{ folders: Array<{ id: string; name: string }> }>(`/folders${query}`)
-      const found = existing.folders.find((folder) => folder.name === name)
-      const id = found?.id ?? (await apiFetch<{ folder: { id: string } }>('/folders', { method: 'POST', body: JSON.stringify({ name, parentId }) })).folder.id
-      cache.set(key, id)
-      parentId = id
-    }
-    return parentId
+    return resolveFolderPath(file.webkitRelativePath, rootFolderId, cache)
   }
 
   function uploadSingleFileMultipart(file: File, folderId: string | null, accountId: string | null, onProgress: (percent: number) => void) {

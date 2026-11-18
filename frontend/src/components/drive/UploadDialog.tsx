@@ -8,19 +8,21 @@ import { cn } from '@/lib/utils'
 import { FolderPicker } from '@/components/drive/FolderPicker'
 import { useUpload } from '@/context/UploadContext'
 import { isDesktop } from '@/lib/runtime'
-import { onFileDrop, pickFiles, inspectPaths } from '@/lib/desktop'
+import { onFileDrop, pickFiles, pickFolder, inspectPaths } from '@/lib/desktop'
 
 const selectClass = 'h-9 w-full rounded-lg border border-border bg-bg px-3 text-[13px] text-text outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/25'
 const fieldLabelClass = 'grid gap-1.5 text-[13px] font-medium text-text'
 
 export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClose: () => void; folderId: string | null }) {
-  const { uploadFiles, uploadPaths } = useUpload()
+  const { uploadFiles, uploadPaths, uploadNativeFiles } = useUpload()
   // Web: browser File objects. Desktop: local paths with names and sizes.
-  const [files, setFiles] = useState<Array<{ name: string; size: number; file?: File; path?: string }>>([])
+  const [files, setFiles] = useState<Array<{ name: string; size: number; file?: File; path?: string; relativePath?: string | null }>>([])
   const [dragging, setDragging] = useState(false)
   const [accounts, setAccounts] = useState<ConnectedAccount[]>([])
   const [targetFolderId, setTargetFolderId] = useState('')
   const [targetAccountId, setTargetAccountId] = useState('')
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
     if (!open) return
@@ -28,6 +30,7 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
     setDragging(false)
     setTargetFolderId(folderId ?? '')
     setTargetAccountId('')
+    setUploadError(null)
     let cancelled = false
     apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts')
       .then((accountData) => {
@@ -45,7 +48,7 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
     if (next.length > 0) setFiles(next.map((file) => ({ name: file.webkitRelativePath || file.name, size: file.size, file })))
   }
 
-  function pickLocal(picked: Array<{ path: string; name: string; size: number }>) {
+  function pickLocal(picked: Array<{ path: string; name: string; size: number; relativePath?: string | null }>) {
     if (picked.length > 0) setFiles(picked)
   }
 
@@ -54,7 +57,7 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
     if (!isDesktop || !open) return
     let unlisten: (() => void) | undefined
     let disposed = false
-    onFileDrop((paths) => { inspectPaths(paths).then(pickLocal).catch(() => undefined) }, setDragging).then((fn) => {
+    onFileDrop((paths) => { inspectPaths(paths).then(pickLocal).catch((error) => setUploadError(String(error))) }, setDragging).then((fn) => {
       if (disposed) fn()
       else unlisten = fn
     })
@@ -72,15 +75,27 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
     if (event.type === 'drop') pick(event.dataTransfer.files)
   }
 
-  function submit(event: FormEvent) {
+  async function submit(event: FormEvent) {
     event.preventDefault()
-    if (files.length === 0) return
+    if (files.length === 0 || submitting) return
     const queued = [...files]
-    onClose()
-    const upload = isDesktop
-      ? uploadPaths(queued.flatMap((f) => (f.path ? [f.path] : [])), targetFolderId || null, targetAccountId || null)
-      : uploadFiles(queued.flatMap((f) => (f.file ? [f.file] : [])), targetFolderId || null, targetAccountId || null)
-    upload.catch((error) => console.error('Upload failed', error))
+    if (!isDesktop) {
+      onClose()
+      void uploadFiles(queued.flatMap((f) => f.file ? [f.file] : []), targetFolderId || null, targetAccountId || null).catch((error) => console.error('Upload failed', error))
+      return
+    }
+    setSubmitting(true)
+    setUploadError(null)
+    try {
+      const nativeFiles = queued.flatMap((f) => f.path ? [{ path: f.path, name: f.name, size: f.size, relativePath: f.relativePath }] : [])
+      if (uploadNativeFiles) await uploadNativeFiles(nativeFiles, targetFolderId || null, targetAccountId || null)
+      else await uploadPaths(nativeFiles.map((file) => file.path), targetFolderId || null, targetAccountId || null)
+      onClose()
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -92,8 +107,8 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
       footer={
         <>
           <Button variant="secondary" onClick={onClose}>Cancel</Button>
-          <Button type="submit" form="upload-dialog-form" disabled={files.length === 0}>
-            {files.length > 1 ? `Upload ${files.length} files` : 'Upload'}
+          <Button type="submit" form="upload-dialog-form" disabled={files.length === 0 || submitting}>
+            {submitting ? 'Preparing…' : files.length > 1 ? `Upload ${files.length} files` : 'Upload'}
           </Button>
         </>
       }
@@ -124,13 +139,17 @@ export function UploadDialog({ open, onClose, folderId }: { open: boolean; onClo
           )}
         </label>
 
+        {isDesktop ? <Button type="button" variant="secondary" onClick={() => { void pickFolder().then(pickLocal).catch((error) => setUploadError(String(error))) }}>Choose folder</Button> : null}
+
+        {uploadError ? <p role="alert" className="text-[13px] text-danger">{uploadError}</p> : null}
+
         {!isDesktop ? <label className="inline-flex w-fit cursor-pointer items-center gap-2 text-[13px] font-medium text-accent hover:underline">Choose a folder<input type="file" multiple className="sr-only" {...{ webkitdirectory: '' }} onChange={(event) => pick(event.target.files)} /></label> : null}
 
         {files.length > 0 ? (
           <ul className="grid max-h-48 gap-1 overflow-y-auto rounded-lg border border-border p-1.5 text-[13px]">
             {files.map((file, index) => (
               <li key={`${file.name}-${file.size}-${index}`} className="flex min-w-0 items-center gap-3 rounded-md px-2 py-1.5">
-                <span className="min-w-0 flex-1 truncate text-text" title={file.name}>{file.name}</span>
+                <span className="min-w-0 flex-1 truncate text-text" title={file.relativePath || file.name}>{file.relativePath || file.name}</span>
                 <span className="shrink-0 text-[12px] tabular-nums text-muted">{formatBytes(file.size)}</span>
                 <button
                   type="button"
