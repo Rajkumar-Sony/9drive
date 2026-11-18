@@ -44,15 +44,42 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
   if (item.status === 'completed') return
   if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
   if (item.sourceFile.providerFileId !== item.sourceProviderId || item.sourceFile.sizeBytes !== item.sizeBytes) throw new Error('Source file changed after this transfer was queued.')
+  if (item.sourceFile.status !== 'active' && !(item.job.kind === 'move' && item.sourceFile.status === 'moved' && item.destinationFileId)) throw new Error('Source file is no longer available for transfer.')
 
   const sourceProvider = storageProvider(item.sourceFile.provider)
   const destinationProvider = storageProvider(item.job.destinationConnectedAccount.provider)
   const source = { ...item.sourceFile, connectedAccount: item.sourceFile.connectedAccount }
+  const recordReplication = async (destinationProviderId: string, checksum: string | null) => {
+    if (!item.job.replicationPlanId) return
+    await prisma.replicationMapping.upsert({
+      where: { planId_sourceProviderId: { planId: item.job.replicationPlanId, sourceProviderId: item.sourceProviderId } },
+      create: { planId: item.job.replicationPlanId, sourceProviderId: item.sourceProviderId, destinationProviderId, sourceVersion: item.sourceFile.updatedAt.toISOString(), checksum, lastReplicatedAt: new Date() },
+      update: { destinationProviderId, sourceVersion: item.sourceFile.updatedAt.toISOString(), checksum, lastReplicatedAt: new Date() },
+    })
+  }
   if (item.destinationFileId && item.destinationProviderId) {
+    const recorded = await prisma.file.findFirst({ where: { id: item.destinationFileId, userId: item.job.userId, connectedAccountId: item.job.destinationConnectedAccountId, providerFileId: item.destinationProviderId, status: 'active' }, include: { connectedAccount: true } })
+    if (!recorded) throw new Error('Recorded destination file is missing; source will not be deleted.')
     if (item.job.kind === 'move' && item.sourceFile.status === 'active') {
-      await sourceProvider.deleteFile(source)
-      await prisma.file.update({ where: { id: item.sourceFileId }, data: { status: 'moved', deletedAt: new Date(), deletedBySync: false } })
+      const remote = await destinationProvider.openDownload(recorded)
+      const verifiedHash = createHash('sha256')
+      let verifiedBytes = 0n
+      for await (const chunk of remote) {
+        verifiedHash.update(chunk)
+        verifiedBytes += BigInt(chunk.length)
+        if (verifiedBytes > item.sizeBytes) throw new Error('Destination file is larger than expected; source will not be deleted.')
+      }
+      if (verifiedBytes !== item.sizeBytes || !item.checksum || verifiedHash.digest('hex') !== item.checksum) {
+        throw new Error('Destination integrity verification failed; source will not be deleted.')
+      }
     }
+    await recordReplication(item.destinationProviderId, item.checksum)
+    if (item.job.kind === 'move' && item.sourceFile.status === 'active') {
+      if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
+      await sourceProvider.deleteFile(source)
+      await prisma.file.updateMany({ where: { id: item.sourceFileId, status: 'active' }, data: { status: 'moved', deletedAt: new Date(), deletedBySync: false } })
+    }
+    if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
     await prisma.transferJobItem.update({ where: { id: item.id }, data: { status: 'completed', completedAt: new Date() } })
     return
   }
@@ -99,12 +126,14 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
     where: { id: item.id },
     data: { status: 'uploaded', destinationProviderId: destination.providerFileId, destinationFileId: file.id, checksum: digest, bytesTransferred: bytes, lastError: null },
   })
+  await recordReplication(destination.providerFileId, digest)
 
   // A move is destructive only after destination bytes and metadata have been confirmed and
   // the worker still owns the current fenced lease.
-  if (item.job.kind === 'move' && await isCurrentLease(jobId, workerId, fencingToken)) {
+  if (item.job.kind === 'move') {
+    if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
     await sourceProvider.deleteFile(source)
-    await prisma.file.update({ where: { id: item.sourceFileId }, data: { status: 'moved', deletedAt: new Date(), deletedBySync: false } })
+    await prisma.file.updateMany({ where: { id: item.sourceFileId, status: 'active' }, data: { status: 'moved', deletedAt: new Date(), deletedBySync: false } })
   }
   if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
   await prisma.transferJobItem.update({ where: { id: item.id }, data: { status: 'completed', completedAt: new Date() } })

@@ -37,3 +37,13 @@
 - Backend unit suite: 13 passed, 11 skipped; frontend unit files: 8 passed. The frontend package has no `test` script, so the files were run with `node --test tests/*.test.ts`.
 - Unauthenticated `GET /transfers` and `POST /transfers` both returned 401. Local API health and migration status passed.
 - Master Test result remains **NOT READY**: real Google/S3/OneDrive transfer workflows, browser multipart/folder flows, job crash recovery, and security/E2E coverage have not been exercised; requested Telegram, MTProto, desktop folder upload, scheduled replication, SSE, and vault work is still incomplete.
+
+## Session 2026-11-18
+- Added durable replication-plan create/list/manual-run endpoints, job-plan linkage migration, authenticated SSE progress, and plan controls on the transfer dashboard.
+- Closed a crash-recovery gap: retrying an already uploaded replication item now restores its mapping before completion, and refuses to delete a move source when its recorded destination row is absent.
+- A retried move now streams the recorded destination back through a bounded SHA-256/size check before source deletion. This guards against a missing or altered remote object after a crash; it still needs a live-provider failure test.
+- Rechecked provider connection/capabilities when running a saved plan; no-change runs finish immediately.
+- Backend build and 13 unit tests passed; 11 database-dependent tests remain skipped. Frontend build passed. Local MySQL accepted migration `20261118090000_transfer_replication_plan_link`; API health and frontend HTTP checks passed after rebuilding containers.
+- Frontend dependency audit currently reports five high advisories through Vite transitive packages. Compatible mitigation and runtime exposure need review.
+- Rebuilt the local API and transfer-worker after the retry-integrity change; unauthenticated transfer, plan, and SSE endpoints returned 401.
+- Master Test remains **NOT READY**. Live cloud provider flows, multi-worker/crash tests, scheduled replication, Telegram adapters, desktop recursive folder upload, vault, and E2E/security validation remain pending.

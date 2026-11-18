@@ -366,6 +366,7 @@ model TransferJob {
   id                       String            @id @default(uuid()) @db.Char(36)
   userId                   String            @map("user_id") @db.Char(36)
   kind                     String            @db.VarChar(24)
+  replicationPlanId        String?           @map("replication_plan_id") @db.Char(36)
   status                   String            @default("queued") @db.VarChar(24)
   sourceConnectedAccountId String            @map("source_connected_account_id") @db.Char(36)
   destinationConnectedAccountId String       @map("destination_connected_account_id") @db.Char(36)
@@ -390,6 +391,7 @@ model TransferJob {
   sourceConnectedAccount    ConnectedAccount   @relation("TransferSourceAccount", fields: [sourceConnectedAccountId], references: [id], onDelete: Restrict)
   destinationConnectedAccount ConnectedAccount @relation("TransferDestinationAccount", fields: [destinationConnectedAccountId], references: [id], onDelete: Restrict)
   items                     TransferJobItem[]
+  replicationPlan           ReplicationPlan?  @relation(fields: [replicationPlanId], references: [id], onDelete: SetNull)
 
   @@index([status, availableAt, priority, createdAt])
   @@index([userId, createdAt])
@@ -437,6 +439,7 @@ model ReplicationPlan {
   updatedAt                DateTime            @updatedAt @map("updated_at")
   user                     User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   mappings                 ReplicationMapping[]
+  jobs                     TransferJob[]
   sourceConnectedAccount   ConnectedAccount   @relation("ReplicationSourceAccount", fields: [sourceConnectedAccountId], references: [id], onDelete: Restrict)
   destinationConnectedAccount ConnectedAccount @relation("ReplicationDestinationAccount", fields: [destinationConnectedAccountId], references: [id], onDelete: Restrict)
 
