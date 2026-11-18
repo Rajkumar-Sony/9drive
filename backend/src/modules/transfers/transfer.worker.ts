@@ -13,17 +13,17 @@ async function claimNextJob(workerId: string) {
     const rows = await tx.$queryRaw<ClaimedJob[]>`
       SELECT id, fencing_token FROM transfer_jobs
       WHERE (status = 'queued' AND available_at <= NOW(3))
-         OR (status = 'running' AND lease_expires_at < NOW(3))
+         OR (status IN ('running', 'cancelling') AND lease_expires_at < NOW(3))
       ORDER BY priority DESC, available_at ASC, created_at ASC
       LIMIT 1 FOR UPDATE SKIP LOCKED`
     const claimed = rows[0]
     if (!claimed) return null
     const job = await tx.transferJob.findUniqueOrThrow({ where: { id: claimed.id } })
-    if (job.status !== 'running') assertTransferJobTransition(job.status, 'running')
+    if (job.status === 'queued') assertTransferJobTransition(job.status, 'running')
     const updated = await tx.transferJob.update({
       where: { id: job.id },
       data: {
-        status: 'running', leaseOwner: workerId,
+        status: job.status === 'cancelling' ? 'cancelling' : 'running', leaseOwner: workerId,
         leaseExpiresAt: new Date(Date.now() + LEASE_MS),
         fencingToken: { increment: 1 }, attemptCount: { increment: 1 },
         startedAt: job.startedAt ?? new Date(),
@@ -33,8 +33,8 @@ async function claimNextJob(workerId: string) {
   })
 }
 
-async function isCurrentLease(jobId: string, workerId: string, fencingToken: bigint) {
-  return (await prisma.transferJob.count({ where: { id: jobId, status: 'running', leaseOwner: workerId, fencingToken, leaseExpiresAt: { gt: new Date() }, cancelRequestedAt: null } })) === 1
+async function isCurrentLease(jobId: string, workerId: string, fencingToken: bigint, allowCancellation = false) {
+  return (await prisma.transferJob.count({ where: { id: jobId, status: allowCancellation ? { in: ['running', 'cancelling'] } : 'running', leaseOwner: workerId, fencingToken, leaseExpiresAt: { gt: new Date() }, ...(allowCancellation ? {} : { cancelRequestedAt: null }) } })) === 1
 }
 
 async function processItem(jobId: string, itemId: string, workerId: string, fencingToken: bigint) {
@@ -142,7 +142,7 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
 async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigint) {
   const heartbeat = setInterval(() => {
     void prisma.transferJob.updateMany({
-      where: { id: jobId, status: 'running', leaseOwner: workerId, fencingToken },
+      where: { id: jobId, status: { in: ['running', 'cancelling'] }, leaseOwner: workerId, fencingToken },
       data: { leaseExpiresAt: new Date(Date.now() + LEASE_MS) },
     }).catch((error) => console.error('[transfer-worker] heartbeat failed', error instanceof Error ? error.message : error))
   }, Math.floor(LEASE_MS / 3))
@@ -150,7 +150,7 @@ async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigi
   try {
     const items = await prisma.transferJobItem.findMany({ where: { jobId, status: { in: ['queued', 'failed', 'running', 'uploaded'] } }, orderBy: { createdAt: 'asc' } })
     for (const item of items) {
-      if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
+      if (!(await isCurrentLease(jobId, workerId, fencingToken))) break
       await prisma.transferJobItem.update({ where: { id: item.id }, data: { status: 'running', attemptCount: { increment: 1 }, lastError: null } })
       try {
         await processItem(jobId, item.id, workerId, fencingToken)
@@ -165,11 +165,11 @@ async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigi
       prisma.transferJobItem.count({ where: { jobId } }),
       prisma.transferJob.findUniqueOrThrow({ where: { id: jobId } }),
     ])
-    if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
+    if (!(await isCurrentLease(jobId, workerId, fencingToken, true))) return
     const status = job.cancelRequestedAt ? 'cancelled' : failedItems === 0 ? 'completed' : completedItems > 0 ? 'partial' : job.attemptCount >= job.maxAttempts ? 'dead_letter' : 'queued'
-    assertTransferJobTransition('running', status)
+    assertTransferJobTransition(job.status, status)
     await prisma.transferJob.updateMany({
-      where: { id: jobId, status: 'running', leaseOwner: workerId, fencingToken },
+      where: { id: jobId, status: job.status, leaseOwner: workerId, fencingToken },
       data: { status, completedItems, failedItems, totalItems, lastError: failedItems ? 'One or more transfer items failed.' : null, completedAt: ['completed', 'cancelled', 'dead_letter'].includes(status) ? new Date() : null, leaseOwner: null, leaseExpiresAt: null, ...(status === 'queued' ? { availableAt: new Date(Date.now() + Math.min(60_000, 1_000 * 2 ** job.attemptCount)) } : {}) },
     })
   } finally {
@@ -189,7 +189,7 @@ export async function runTransferWorker(options: { once?: boolean; workerId?: st
     await runClaimedJob(job.id, workerId, job.fencingToken).catch(async (error) => {
       const message = error instanceof Error ? error.message : 'Worker failure.'
       await prisma.transferJob.updateMany({
-        where: { id: job.id, status: 'running', leaseOwner: workerId, fencingToken: job.fencingToken },
+        where: { id: job.id, status: { in: ['running', 'cancelling'] }, leaseOwner: workerId, fencingToken: job.fencingToken },
         data: { status: 'failed', lastError: message.slice(0, 2000), leaseOwner: null, leaseExpiresAt: null },
       })
       console.error('[transfer-worker] job failed', { jobId: job.id, message })

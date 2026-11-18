@@ -12,6 +12,8 @@ test('transfer job state machine allows recoverable pause and retry paths', asyn
   assert.equal(canTransitionTransferJob('running', 'paused'), true)
   assert.equal(canTransitionTransferJob('failed', 'queued'), true)
   assert.equal(canTransitionTransferJob('dead_letter', 'queued'), true)
+  assert.equal(canTransitionTransferJob('running', 'cancelling'), true)
+  assert.equal(canTransitionTransferJob('cancelling', 'cancelled'), true)
 })
 
 test('transfer job state machine rejects unsafe terminal and cross-state transitions', async () => {

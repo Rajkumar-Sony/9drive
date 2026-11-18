@@ -142,11 +142,11 @@ transferRouter.post('/:id/:action', async (req: AuthRequest, res, next) => {
     const action = z.enum(['pause', 'resume', 'cancel', 'retry']).parse(req.params.action)
     const job = await prisma.transferJob.findFirst({ where: { id: String(req.params.id), userId: req.user!.id } })
     if (!job) return res.status(404).json({ code: 'TRANSFER_NOT_FOUND', message: 'Transfer not found.' })
-    const nextStatus = action === 'resume' || action === 'retry' ? 'queued' : action === 'cancel' ? 'cancelled' : 'paused'
+    const nextStatus = action === 'resume' || action === 'retry' ? 'queued' : action === 'cancel' ? job.status === 'running' ? 'cancelling' : 'cancelled' : 'paused'
     assertTransferJobTransition(job.status, nextStatus)
     const result = await prisma.transferJob.updateMany({ where: { id: job.id, userId: req.user!.id, status: job.status, fencingToken: job.fencingToken }, data: {
       status: nextStatus, ...(nextStatus === 'queued' ? { availableAt: new Date(), cancelRequestedAt: null, leaseOwner: null, leaseExpiresAt: null } : {}),
-      ...(nextStatus === 'cancelled' ? { cancelRequestedAt: new Date() } : {}),
+      ...(['cancelled', 'cancelling'].includes(nextStatus) ? { cancelRequestedAt: new Date() } : {}),
     } })
     if (result.count !== 1) return res.status(409).json({ code: 'TRANSFER_STATE_CHANGED', message: 'Transfer changed while this action was requested. Refresh and retry.' })
     const updated = await prisma.transferJob.findUniqueOrThrow({ where: { id: job.id } })
