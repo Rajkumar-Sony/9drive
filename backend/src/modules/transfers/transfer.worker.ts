@@ -3,10 +3,40 @@ import { Transform } from 'node:stream'
 import { prisma } from '../../config/prisma.js'
 import { storageProvider } from '../storage-providers/provider.js'
 import { assertTransferJobTransition } from './transfer-state.js'
+import { createReplicationRun } from './replication-run.js'
+import { REPLICATION_SCHEDULES, nextReplicationRun, type ReplicationSchedule } from './replication-schedule.js'
+import { HttpError } from '../../middleware/error.middleware.js'
 
 const LEASE_MS = 120_000
 const IDLE_MS = 1_500
 type ClaimedJob = { id: string; fencing_token: bigint }
+
+export async function scheduleDueReplication() {
+  let duePlanId: string | null = null
+  try {
+    await prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM replication_plans
+        WHERE status = 'active' AND schedule_cron IS NOT NULL AND next_run_at <= NOW(3)
+        ORDER BY next_run_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`
+      if (!rows.length) return
+      duePlanId = rows[0].id
+      const plan = await tx.replicationPlan.findUniqueOrThrow({ where: { id: duePlanId } })
+      if (!REPLICATION_SCHEDULES.includes(plan.scheduleCron as ReplicationSchedule)) throw new HttpError(400, 'INVALID_REPLICATION_SCHEDULE', 'Replication schedule is invalid.')
+      const active = await tx.transferJob.count({ where: { replicationPlanId: plan.id, status: { in: ['queued', 'running', 'cancelling'] } } })
+      if (active) {
+        await tx.replicationPlan.update({ where: { id: plan.id }, data: { nextRunAt: nextReplicationRun(plan.scheduleCron as ReplicationSchedule, new Date()) } })
+        return
+      }
+      await createReplicationRun(tx, plan)
+      await tx.replicationPlan.update({ where: { id: plan.id }, data: { nextRunAt: nextReplicationRun(plan.scheduleCron as ReplicationSchedule, new Date()) } })
+    }, { timeout: 30_000 })
+  } catch (error) {
+    // A broken plan must not spin the scheduler or block other due plans.
+    if (duePlanId && error instanceof HttpError) await prisma.replicationPlan.updateMany({ where: { id: duePlanId, status: 'active', nextRunAt: { lte: new Date() } }, data: { status: 'paused' } })
+    console.error('[transfer-worker] scheduled replication failed', { planId: duePlanId, message: error instanceof Error ? error.message : String(error) })
+  }
+}
 
 async function claimNextJob(workerId: string) {
   return prisma.$transaction(async (tx) => {
@@ -180,6 +210,7 @@ async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigi
 export async function runTransferWorker(options: { once?: boolean; workerId?: string } = {}) {
   const workerId = options.workerId ?? `worker-${process.pid}`
   do {
+    await scheduleDueReplication()
     const job = await claimNextJob(workerId)
     if (!job) {
       if (options.once) return

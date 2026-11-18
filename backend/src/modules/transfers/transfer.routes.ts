@@ -6,6 +6,8 @@ import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.
 import { storageProvider, assertProviderCapability } from '../storage-providers/provider.js'
 import { assertTransferJobTransition } from './transfer-state.js'
 import { keepBothName } from './conflict-name.js'
+import { createReplicationRun } from './replication-run.js'
+import { REPLICATION_SCHEDULES, nextReplicationRun } from './replication-schedule.js'
 
 export const transferRouter = Router()
 transferRouter.use(requireAuth)
@@ -22,6 +24,7 @@ const replicationPlanSchema = z.object({
   name: z.string().trim().min(1).max(191),
   sourceAccountId: z.string().uuid(),
   destinationAccountId: z.string().uuid(),
+  scheduleCron: z.enum(REPLICATION_SCHEDULES).nullable().default(null),
 })
 
 transferRouter.post('/plans', async (req: AuthRequest, res, next) => {
@@ -34,7 +37,7 @@ transferRouter.post('/plans', async (req: AuthRequest, res, next) => {
     if (!source || !destination) return res.status(404).json({ code: 'ACCOUNT_NOT_FOUND', message: 'Source or destination account was not found.' })
     assertProviderCapability(storageProvider(source.provider), 'download')
     assertProviderCapability(storageProvider(destination.provider), 'upload')
-    const plan = await prisma.replicationPlan.create({ data: { userId: req.user!.id, name: body.name, sourceConnectedAccountId: source.id, destinationConnectedAccountId: destination.id } })
+    const plan = await prisma.replicationPlan.create({ data: { userId: req.user!.id, name: body.name, sourceConnectedAccountId: source.id, destinationConnectedAccountId: destination.id, scheduleCron: body.scheduleCron, nextRunAt: body.scheduleCron ? nextReplicationRun(body.scheduleCron, new Date()) : null } })
     return res.status(201).json({ plan })
   } catch (error) { return next(error) }
 })
@@ -46,30 +49,26 @@ transferRouter.get('/plans', async (req: AuthRequest, res, next) => {
   } catch (error) { return next(error) }
 })
 
+transferRouter.patch('/plans/:id/schedule', async (req: AuthRequest, res, next) => {
+  try {
+    const body = z.object({ scheduleCron: z.enum(REPLICATION_SCHEDULES).nullable() }).parse(req.body)
+    const result = await prisma.replicationPlan.updateMany({ where: { id: String(req.params.id), userId: req.user!.id }, data: { scheduleCron: body.scheduleCron, nextRunAt: body.scheduleCron ? nextReplicationRun(body.scheduleCron, new Date()) : null, status: 'active' } })
+    if (!result.count) return res.status(404).json({ code: 'REPLICATION_PLAN_NOT_FOUND', message: 'Replication plan not found.' })
+    const plan = await prisma.replicationPlan.findUniqueOrThrow({ where: { id: String(req.params.id) } })
+    return res.json({ plan })
+  } catch (error) { return next(error) }
+})
+
 transferRouter.post('/plans/:id/run', async (req: AuthRequest, res, next) => {
   try {
-    const plan = await prisma.replicationPlan.findFirst({ where: { id: String(req.params.id), userId: req.user!.id, status: 'active' } })
-    if (!plan) return res.status(404).json({ code: 'REPLICATION_PLAN_NOT_FOUND', message: 'Replication plan not found.' })
-    const accounts = await prisma.connectedAccount.findMany({ where: { id: { in: [plan.sourceConnectedAccountId, plan.destinationConnectedAccountId] }, userId: req.user!.id, status: 'connected' } })
-    const source = accounts.find((account) => account.id === plan.sourceConnectedAccountId)
-    const destination = accounts.find((account) => account.id === plan.destinationConnectedAccountId)
-    if (!source || !destination) return res.status(409).json({ code: 'ACCOUNT_DISCONNECTED', message: 'Reconnect both accounts before running this plan.' })
-    assertProviderCapability(storageProvider(source.provider), 'download')
-    assertProviderCapability(storageProvider(destination.provider), 'upload')
-    const alreadyRunning = await prisma.transferJob.count({ where: { userId: req.user!.id, kind: 'replicate', sourceConnectedAccountId: plan.sourceConnectedAccountId, destinationConnectedAccountId: plan.destinationConnectedAccountId, status: { in: ['queued', 'running'] } } })
-    if (alreadyRunning) return res.status(409).json({ code: 'REPLICATION_ALREADY_RUNNING', message: 'A replication between these accounts is already running.' })
-    const files = await prisma.file.findMany({ where: { userId: req.user!.id, connectedAccountId: plan.sourceConnectedAccountId, status: 'active' }, orderBy: { id: 'asc' }, take: 1001 })
-    if (files.length > 1000) return res.status(409).json({ code: 'REPLICATION_TOO_LARGE', message: 'This plan has more than 1,000 files; batch support is required before running it.' })
-    const mappings = await prisma.replicationMapping.findMany({ where: { planId: plan.id }, select: { sourceProviderId: true, sourceVersion: true, destinationProviderId: true } })
-    const destinationIds = mappings.map((mapping) => mapping.destinationProviderId)
-    const destinationFiles = await prisma.file.findMany({ where: { userId: req.user!.id, connectedAccountId: plan.destinationConnectedAccountId, providerFileId: { in: destinationIds }, status: 'active' }, select: { providerFileId: true } })
-    const existingDestinations = new Set(destinationFiles.map((file) => file.providerFileId))
-    const versions = new Map(mappings.filter((mapping) => existingDestinations.has(mapping.destinationProviderId)).map((mapping) => [mapping.sourceProviderId, mapping.sourceVersion]))
-    const pending = files.filter((file) => versions.get(file.providerFileId) !== file.updatedAt.toISOString())
-    const maxUpload = storageProvider(destination.provider).capabilities.maxUploadBytes
-    if (maxUpload !== null && pending.some((file) => file.sizeBytes > maxUpload)) return res.status(409).json({ code: 'PROVIDER_FILE_TOO_LARGE', message: 'A source file exceeds the destination provider limit.' })
-    const job = await prisma.transferJob.create({ data: { userId: req.user!.id, kind: 'replicate', replicationPlanId: plan.id, sourceConnectedAccountId: plan.sourceConnectedAccountId, destinationConnectedAccountId: plan.destinationConnectedAccountId, status: pending.length ? 'queued' : 'completed', completedAt: pending.length ? null : new Date(), totalItems: pending.length, items: { create: pending.map((file) => ({ sourceFileId: file.id, sourceProviderId: file.providerFileId, destinationName: file.name, sizeBytes: file.sizeBytes })) } } })
-    await prisma.replicationPlan.update({ where: { id: plan.id }, data: { lastRunAt: new Date() } })
+    const job = await prisma.$transaction(async (tx) => {
+      const id = String(req.params.id)
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM replication_plans WHERE id = ${id} AND user_id = ${req.user!.id} AND status IN ('active', 'paused') FOR UPDATE`
+      if (!locked.length) return null
+      const plan = await tx.replicationPlan.findUniqueOrThrow({ where: { id } })
+      return createReplicationRun(tx, plan)
+    }, { timeout: 30_000 })
+    if (!job) return res.status(404).json({ code: 'REPLICATION_PLAN_NOT_FOUND', message: 'Replication plan not found.' })
     return res.status(201).json({ job: { ...job, fencingToken: job.fencingToken.toString() } })
   } catch (error) { return next(error) }
 })
