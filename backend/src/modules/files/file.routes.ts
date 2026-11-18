@@ -12,7 +12,7 @@ import { syncGoogleDrive } from '../google/drive-sync.js'
 import { syncOneDriveFiles } from '../onedrive/onedrive-sync.js'
 import { deleteS3Object, syncS3Quota, createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
 import { streamProviderFile } from './stream-file.js'
-import { storageProvider } from '../storage-providers/provider.js'
+import { assertProviderCapability, storageProvider } from '../storage-providers/provider.js'
 import { newShareToken, readShareToken, shareUrl } from './share-token.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders, withExtension } from './stream-google-file.js'
 import { GetObjectCommand } from '@aws-sdk/client-s3'
@@ -395,6 +395,7 @@ fileRouter.post('/:id/share', async (req: AuthRequest, res, next) => {
   try {
     const fileId = String(req.params.id)
     const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id, status: 'active' } })
+    if (await prisma.vaultObject.findUnique({ where: { fileId: file.id }, select: { fileId: true } })) return res.status(409).json({ code: 'VAULT_SHARING_DISABLED', message: 'Encrypted vault items cannot be shared through the standard file-sharing flow.' })
     const activeShare = await prisma.fileShare.findFirst({ where: { fileId: file.id, userId: req.user!.id, enabled: true, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] }, orderBy: { createdAt: 'desc' } })
 
     const body = shareBodySchema.parse(req.body ?? {})
@@ -434,6 +435,7 @@ fileRouter.post('/:id/public-permission', async (req: AuthRequest, res, next) =>
   try {
     const fileId = String(req.params.id)
     const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id, status: 'active' }, include: { connectedAccount: true } })
+    if (await prisma.vaultObject.findUnique({ where: { fileId: file.id }, select: { fileId: true } })) return res.status(409).json({ code: 'VAULT_SHARING_DISABLED', message: 'Encrypted vault items cannot be shared through the standard file-sharing flow.' })
     if (file.provider !== 'google_drive') {
       return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'Only Google Drive files can be made public.' })
     }
@@ -563,11 +565,10 @@ fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
     // Open each upstream body only when the archive is ready for it. Opening all of them up
     // front left most bodies idle until they timed out.
     const openFileStream = async (file: (typeof files)[number]): Promise<{ stream: Readable; fileName: string }> => {
-      if (file.provider === 's3') {
-        const config = await getS3ConfigForAccount(file.connectedAccountId)
-        const client = createS3Client(config)
-        const response = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: file.providerFileId }))
-        return { stream: response.Body as Readable, fileName: file.name }
+      if (file.provider !== 'google_drive') {
+        const provider = storageProvider(file.provider)
+        assertProviderCapability(provider, 'download')
+        return { stream: await provider.openDownload(file), fileName: file.name }
       }
       const auth = await getAuthedGoogleClient(file.connectedAccount)
       const headers = normalizeHeaders(await auth.getRequestHeaders())

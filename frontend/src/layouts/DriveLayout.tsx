@@ -28,6 +28,7 @@ const pageNames: Record<string, string> = {
   '/trash': 'Trash',
   '/quota': 'Accounts & quota',
   '/transfers': 'Transfers',
+  '/vault': 'Encrypted vault',
   '/activity': 'Activity',
   '/settings': 'Settings',
   '/api': 'API keys',

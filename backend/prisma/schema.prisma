@@ -36,6 +36,7 @@ model User {
   transferJobs TransferJob[]
   replicationPlans ReplicationPlan[]
   vaultObjects VaultObject[]
+  telegramAuthChallenges TelegramAuthChallenge[]
 
   @@map("users")
 }
@@ -152,6 +153,7 @@ model ConnectedAccount {
   avatarUrl             String?         @map("avatar_url") @db.Text
   accessTokenEncrypted  String?         @map("access_token_encrypted") @db.Text
   refreshTokenEncrypted String?         @map("refresh_token_encrypted") @db.Text
+  telegramSessionEncrypted String?      @map("telegram_session_encrypted") @db.Text
   tokenExpiresAt        DateTime?       @map("token_expires_at")
   // Google Drive changes feed: where the next incremental sync starts, and when the last full
   // import ran (a full one runs at least daily). Cleared on disconnect.
@@ -226,7 +228,7 @@ model File {
   connectedAccountId String           @map("connected_account_id") @db.Char(36)
   folderId           String?          @map("folder_id") @db.Char(36)
   provider           String           @db.VarChar(32)
-  providerFileId     String           @map("provider_file_id") @db.VarChar(191)
+  providerFileId     String           @map("provider_file_id") @db.VarChar(512)
   name               String           @db.VarChar(255)
   mimeType           String           @map("mime_type") @db.VarChar(191)
   sizeBytes          BigInt           @map("size_bytes")
@@ -351,6 +353,7 @@ model UploadSession {
   s3UploadId               String?           @map("s3_upload_id") @db.Text
   objectKey                String?           @map("object_key") @db.VarChar(1024)
   providerSessionData      Json?             @map("provider_session_data")
+  completionLeaseExpiresAt DateTime?         @map("completion_lease_expires_at")
   relativePath             String?           @map("relative_path") @db.Text
   errorMessage             String?           @map("error_message") @db.Text
   createdAt                DateTime          @default(now()) @map("created_at")
@@ -483,6 +486,23 @@ model VaultObject {
 
   @@index([userId, createdAt])
   @@map("vault_objects")
+}
+
+model TelegramAuthChallenge {
+  id                  String   @id @default(uuid()) @db.Char(36)
+  userId              String   @map("user_id") @db.Char(36)
+  phoneEncrypted      String   @map("phone_encrypted") @db.Text
+  phoneCodeHashEncrypted String @map("phone_code_hash_encrypted") @db.Text
+  sessionEncrypted    String   @map("session_encrypted") @db.Text
+  status              String   @default("awaiting_code") @db.VarChar(24)
+  attemptCount        Int      @default(0) @map("attempt_count")
+  expiresAt           DateTime @map("expires_at")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("telegram_auth_challenges")
 }
 
 model AuditLog {

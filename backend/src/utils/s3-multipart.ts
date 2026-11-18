@@ -26,3 +26,10 @@ export function completedPartsInOrder(parts: Array<{ partNumber: number; etag: s
   }
   return sorted
 }
+
+// A completing session is protected for a lease so a second request cannot race the same
+// provider operation. An expired lease permits a retry to reconcile provider state.
+export function mayClaimMultipartCompletion(status: string, leaseExpiresAt: Date | null, now = new Date()) {
+  if (status === 'uploading') return true
+  return status === 'completing' && (!leaseExpiresAt || leaseExpiresAt <= now)
+}

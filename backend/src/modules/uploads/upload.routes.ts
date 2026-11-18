@@ -1,23 +1,25 @@
 import Busboy from 'busboy'
 import type { NextFunction, Response } from 'express'
 import { Router } from 'express'
-import { Transform, type Readable } from 'node:stream'
+import { type Readable } from 'node:stream'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { google } from '../google/google-apis.js'
-import type { ConnectedAccount, Folder, UploadSession } from '../../generated/prisma/client.js'
+import type { ConnectedAccount, File, Folder, UploadSession } from '../../generated/prisma/client.js'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { driveParentForFolder, ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
-import { abortS3MultipartUpload, buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, deleteS3Key, getS3ConfigForAccount, isPrivateS3Endpoint, listS3UploadedParts, presignS3UploadParts, syncS3Quota, uploadS3Object, uploadS3Part } from '../s3/s3.service.js'
-import { completedPartsInOrder, s3PartCount, s3PartSize } from '../../utils/s3-multipart.js'
+import { abortS3MultipartUpload, buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, deleteS3Key, getS3ConfigForAccount, headS3ObjectSize, isPrivateS3Endpoint, listS3UploadedParts, presignS3UploadParts, syncS3Quota, uploadS3Object, uploadS3Part } from '../s3/s3.service.js'
+import { completedPartsInOrder, mayClaimMultipartCompletion, s3PartCount, s3PartSize } from '../../utils/s3-multipart.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { accountLabel } from '../../utils/account-label.js'
 import { nextOffsetFromRange } from '../../utils/resumable-range.js'
 import { oneDriveGraph, syncOneDriveQuota } from '../onedrive/onedrive.service.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 import { storageProvider } from '../storage-providers/provider.js'
+import { HttpError } from '../../middleware/error.middleware.js'
+import { countStreamBytes } from '../../utils/count-stream.js'
 
 export const uploadRouter = Router()
 
@@ -39,20 +41,6 @@ function syncQuotaInBackground(accountId: string, sessionId: string) {
     .catch((error) => logUpload('quota sync failed', { accountId, sessionId, message: error instanceof Error ? error.message : 'Unknown error' }))
 }
 
-// Passes a stream through unchanged while counting its bytes.
-function countBytes(source: Readable) {
-  let bytes = 0n
-  const counter = new Transform({
-    transform(chunk: Buffer, _encoding, callback) {
-      bytes += BigInt(chunk.length)
-      callback(null, chunk)
-    },
-  })
-  source.on('error', (error) => counter.destroy(error))
-  source.pipe(counter)
-  return { stream: counter, bytes: () => bytes }
-}
-
 function normalizePriorityAccountIds(value: unknown) {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
@@ -71,11 +59,11 @@ function byPriority<T extends { account: { id: string; createdAt: Date } }>(item
 
 async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByAccount = new Map<string, bigint>(), targetAccountId?: string | null) {
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3', 'onedrive'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
+    where: { userId, provider: { in: ['google_drive', 's3', 'onedrive', 'telegram_bot', 'telegram_mtproto'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
     include: { storageAccount: true },
   })
 
-  const stale = accounts.filter((account) => !account.storageAccount?.lastSyncedAt || account.storageAccount.lastSyncedAt.getTime() < Date.now() - 5 * 60_000)
+  const stale = accounts.filter((account) => storageProvider(account.provider).capabilities.quota && (!account.storageAccount?.lastSyncedAt || account.storageAccount.lastSyncedAt.getTime() < Date.now() - 5 * 60_000))
   await Promise.allSettled(stale.map(async (account) => {
     try {
       if (account.provider === 's3') {
@@ -95,7 +83,7 @@ async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByA
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3', 'onedrive'] }, status: 'connected' },
+    where: { userId, provider: { in: ['google_drive', 's3', 'onedrive', 'telegram_bot', 'telegram_mtproto'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
     include: { storageAccount: true },
   })
 
@@ -232,7 +220,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         logUpload('file upload started', { sessionId: session.id, accountId: account.id, fileName, sizeBytes: meta.sizeBytes.toString() })
 
         // Stream straight to the provider; nothing is buffered whole in memory or written to disk.
-        const counted = countBytes(fileStream)
+        const counted = countStreamBytes(fileStream)
         const sizeMatches = () => !fileStream.truncated && counted.bytes() === meta.sizeBytes
         const rejectSizeMismatch = async () => {
           await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'Streamed byte count did not match declared size.' } })
@@ -264,6 +252,12 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           const stored = await storageProvider('onedrive').uploadStream({ userId: req.user!.id, account, fileId: randomUUID(), name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, body: counted.stream })
           if (!sizeMatches()) return rejectSizeMismatch()
           const file = await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'onedrive', providerFileId: stored.providerFileId, name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes } })
+          completed.push({ ...file, sizeBytes: file.sizeBytes.toString() })
+          await auditUpload(req.user!.id, file, meta.sizeBytes, account)
+        } else if (account.provider === 'telegram_bot' || account.provider === 'telegram_mtproto') {
+          const stored = await storageProvider(account.provider).uploadStream({ userId: req.user!.id, account, fileId: randomUUID(), name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, body: counted.stream })
+          if (!sizeMatches() || stored.confirmedSizeBytes !== meta.sizeBytes) return rejectSizeMismatch()
+          const file = await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: account.provider, providerFileId: stored.providerFileId, name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, providerVersion: stored.providerVersion ?? null } })
           completed.push({ ...file, sizeBytes: file.sizeBytes.toString() })
           await auditUpload(req.user!.id, file, meta.sizeBytes, account)
         } else {
@@ -351,6 +345,57 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
 }
 
 uploadRouter.post('/', requireAuth, handleUpload)
+
+// Zero-knowledge vault ingress: this endpoint accepts already-encrypted bytes and a bounded,
+// authenticated envelope. It never parses plaintext or accepts a plaintext filename or MIME type.
+uploadRouter.post('/vault', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/vnd.oneconnect.vault') throw new HttpError(415, 'VAULT_CONTENT_TYPE_INVALID', 'Vault uploads must use the encrypted vault stream format.')
+    const encodedEnvelope = z.string().min(1).max(8192).regex(/^[A-Za-z0-9_-]+$/).parse(req.headers['x-vault-envelope'])
+    const envelopeBytes = Buffer.from(encodedEnvelope, 'base64url')
+    if (envelopeBytes.toString('base64url') !== encodedEnvelope) throw new HttpError(400, 'VAULT_ENVELOPE_INVALID', 'The encrypted vault envelope is invalid.')
+    const envelope = z.object({
+      formatVersion: z.literal(1),
+      salt: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/),
+      keyWrap: z.string().min(1).max(4096),
+      encryptedMetadata: z.string().min(1).max(4096).regex(/^[A-Za-z0-9_-]+$/),
+      encryptionAlgorithm: z.literal('xchacha20poly1305-secretstream+argon2id-v1'),
+    }).parse(JSON.parse(envelopeBytes.toString('utf8')))
+    const salt = Buffer.from(envelope.salt, 'base64url')
+    const metadata = Buffer.from(envelope.encryptedMetadata, 'base64url')
+    if (salt.toString('base64url') !== envelope.salt || metadata.toString('base64url') !== envelope.encryptedMetadata || salt.length !== 16 || metadata.length < 40) throw new HttpError(400, 'VAULT_ENVELOPE_INVALID', 'The encrypted vault envelope is invalid.')
+    let keyWrap: unknown
+    try { keyWrap = JSON.parse(envelope.keyWrap) } catch { throw new HttpError(400, 'VAULT_ENVELOPE_INVALID', 'The encrypted vault key envelope is invalid.') }
+    z.object({ version: z.literal(1), opsLimit: z.number().int().positive(), memLimit: z.number().int().positive(), passphrase: z.object({ nonce: z.string(), cipher: z.string() }), recovery: z.object({ nonce: z.string(), cipher: z.string() }) }).parse(keyWrap)
+    const cipherSize = BigInt(z.string().regex(/^[1-9]\d{0,15}$/).parse(req.headers['x-vault-cipher-size']))
+    if (cipherSize > BigInt(env.MAX_UPLOAD_BYTES)) throw new HttpError(413, 'UPLOAD_TOO_LARGE', 'The encrypted vault item exceeds the configured upload limit.')
+    const requestLength = req.headers['content-length']
+    if (requestLength && (!/^\d+$/.test(requestLength) || BigInt(requestLength) > cipherSize)) throw new HttpError(413, 'VAULT_CIPHER_SIZE_MISMATCH', 'The encrypted request body exceeds its declared ciphertext size.')
+    const targetAccountId = req.headers['x-vault-account-id'] ? z.string().uuid().parse(req.headers['x-vault-account-id']) : undefined
+    const account = await selectAccount(req.user!.id, cipherSize, new Map(), targetAccountId)
+    if (!account) throw new HttpError(409, 'NO_STORAGE_AVAILABLE', 'No connected storage account can accept this encrypted vault item.')
+    const provider = storageProvider(account.provider)
+    if (provider.capabilities.maxUploadBytes !== null && cipherSize > provider.capabilities.maxUploadBytes) throw new HttpError(413, 'PROVIDER_FILE_TOO_LARGE', 'This encrypted vault item exceeds the selected provider’s upload limit.')
+    const fileId = randomUUID()
+    const name = `Encrypted item ${fileId.slice(0, 8)}`
+    const counted = countStreamBytes(req, cipherSize, new HttpError(413, 'VAULT_CIPHER_SIZE_MISMATCH', 'The encrypted request body exceeds its declared ciphertext size.'))
+    const stored = await provider.uploadStream({ userId: req.user!.id, account, fileId, name, mimeType: 'application/octet-stream', sizeBytes: cipherSize, body: counted.stream })
+    if (counted.bytes() !== cipherSize || stored.confirmedSizeBytes !== cipherSize) {
+      if (provider.capabilities.delete) {
+        const cleanupFile = { id: fileId, userId: req.user!.id, connectedAccountId: account.id, folderId: null, provider: account.provider, providerFileId: stored.providerFileId, name, mimeType: 'application/octet-stream', sizeBytes: cipherSize, checksum: null, providerVersion: stored.providerVersion ?? null, status: 'active', createdAt: new Date(), updatedAt: new Date(), deletedAt: null, deletedBySync: false, connectedAccount: account } as File & { connectedAccount: ConnectedAccount }
+        await provider.deleteFile(cleanupFile).catch(() => undefined)
+      }
+      throw new HttpError(400, 'VAULT_CIPHER_SIZE_MISMATCH', 'The encrypted upload did not match its declared size.')
+    }
+    const vaultObject = await prisma.$transaction(async (tx) => {
+      await tx.file.create({ data: { id: fileId, userId: req.user!.id, connectedAccountId: account.id, provider: account.provider, providerFileId: stored.providerFileId, name, mimeType: 'application/octet-stream', sizeBytes: cipherSize, providerVersion: stored.providerVersion ?? null } })
+      return tx.vaultObject.create({ data: { userId: req.user!.id, fileId, formatVersion: envelope.formatVersion, encryptedMetadata: metadata, salt, keyWrap: Buffer.from(envelope.keyWrap, 'utf8'), encryptionAlgorithm: envelope.encryptionAlgorithm } })
+    })
+    await createAuditLog(req.user!.id, 'UPLOAD_VAULT_OBJECT', 'vault_object', fileId, { provider: account.provider, sizeBytes: cipherSize.toString() })
+    if (provider.capabilities.quota) void provider.syncQuota(account.id).catch(() => undefined)
+    return res.status(201).json({ object: { fileId, name, sizeBytes: cipherSize.toString(), provider: account.provider, createdAt: vaultObject.createdAt } })
+  } catch (error) { return next(error) }
+})
 
 type DriveFileResource = { id: string; name?: string; mimeType?: string }
 
@@ -628,6 +673,18 @@ uploadRouter.delete('/resumable/:id', requireAuth, async (req: AuthRequest, res,
     const session = await prisma.uploadSession.findFirst({ where: { id: String(req.params.id), userId: req.user!.id } })
     if (!session) return res.status(404).json({ code: 'UPLOAD_SESSION_NOT_FOUND', message: 'Upload session not found.' })
     if (session.status === 'completed') return res.json({ status: 'completed' })
+    if (session.status === 'completing' && session.completionLeaseExpiresAt && session.completionLeaseExpiresAt > new Date()) return res.status(409).json({ code: 'UPLOAD_COMPLETION_IN_PROGRESS', message: 'Wait for S3 to finish this upload before cancelling it.' })
+    if (session.status === 'cancelled') return res.json({ status: 'cancelled' })
+    const cancelled = await prisma.uploadSession.updateMany({
+      where: {
+        id: session.id,
+        userId: req.user!.id,
+        status: session.status,
+        ...(session.status === 'completing' ? { completionLeaseExpiresAt: session.completionLeaseExpiresAt } : {}),
+      },
+      data: { status: 'cancelled', completionLeaseExpiresAt: null },
+    })
+    if (cancelled.count === 0) return res.status(409).json({ code: 'UPLOAD_SESSION_CLOSED', message: 'This upload changed state. Refresh its status before retrying.' })
     if (session.provider === 's3' && session.s3UploadId && session.objectKey && session.targetConnectedAccountId) {
       const config = await getS3ConfigForAccount(session.targetConnectedAccountId, req.user!.id)
       await abortS3MultipartUpload(config, session.objectKey, session.s3UploadId).catch(() => undefined)
@@ -637,7 +694,6 @@ uploadRouter.delete('/resumable/:id', requireAuth, async (req: AuthRequest, res,
     } else if (session.googleSessionUri) {
       await fetch(session.googleSessionUri, { method: 'DELETE' }).catch(() => undefined)
     }
-    await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'cancelled' } })
     return res.json({ status: 'cancelled' })
   } catch (error) {
     return next(error)
@@ -654,6 +710,18 @@ async function loadS3Session(req: AuthRequest) {
 }
 
 const sessionNotFound = (res: Response) => res.status(404).json({ code: 'UPLOAD_SESSION_NOT_FOUND', message: 'Upload session not found.' })
+
+async function recordCompletedS3Upload(session: UploadSession, account: ConnectedAccount, objectKey: string) {
+  let file = await prisma.file.findFirst({ where: { userId: session.userId, connectedAccountId: account.id, provider: 's3', providerFileId: objectKey } })
+  const created = !file
+  if (!file) file = await prisma.file.create({
+    data: { userId: session.userId, connectedAccountId: account.id, folderId: session.folderId, provider: 's3', providerFileId: objectKey, name: session.fileName, mimeType: session.mimeType, sizeBytes: session.sizeBytes, status: 'active' },
+  })
+  await prisma.uploadSession.updateMany({ where: { id: session.id, userId: session.userId, status: { in: ['uploading', 'completing', 'completed'] } }, data: { status: 'completed', completedAt: new Date(), completionLeaseExpiresAt: null } })
+  if (created) await auditUpload(session.userId, file, file.sizeBytes, account)
+  void syncS3Quota(account.id).catch(() => undefined)
+  return file
+}
 
 uploadRouter.put('/s3/:id/parts/:partNumber', requireAuth, async (req: AuthRequest, res, next) => {
   try {
@@ -692,8 +760,35 @@ uploadRouter.get('/s3/:id/parts', requireAuth, async (req: AuthRequest, res, nex
     const loaded = await loadS3Session(req)
     if (!loaded) return sessionNotFound(res)
     const partSize = s3PartSize(loaded.session.sizeBytes)
-    if (loaded.session.status === 'completed') return res.json({ status: 'completed', parts: [], partSize, partCount: s3PartCount(loaded.session.sizeBytes, partSize) })
-    return res.json({ status: loaded.session.status, parts: await listS3UploadedParts(loaded.config, loaded.objectKey, loaded.uploadId), partSize, partCount: s3PartCount(loaded.session.sizeBytes, partSize) })
+    const partCount = s3PartCount(loaded.session.sizeBytes, partSize)
+    if (loaded.session.status === 'completed') return res.json({ status: 'completed', parts: [], partSize, partCount })
+    if (loaded.session.status === 'failed' || loaded.session.status === 'cancelled') return res.status(410).json({ code: 'S3_UPLOAD_EXPIRED', message: 'This S3 multipart session is no longer available. Start the upload again.' })
+    if (loaded.session.status === 'completing') {
+      const remoteSize = await headS3ObjectSize(loaded.config, loaded.objectKey)
+      if (remoteSize === loaded.session.sizeBytes) {
+        const account = await prisma.connectedAccount.findFirstOrThrow({ where: { id: loaded.session.targetConnectedAccountId!, userId: req.user!.id } })
+        await recordCompletedS3Upload(loaded.session, account, loaded.objectKey)
+        return res.json({ status: 'completed', parts: [], partSize, partCount })
+      }
+      if (remoteSize !== null) {
+        await deleteS3Key(loaded.config, loaded.objectKey).catch(() => undefined)
+        await prisma.uploadSession.update({ where: { id: loaded.session.id }, data: { status: 'failed', errorMessage: `Stored ${remoteSize} bytes, expected ${loaded.session.sizeBytes}.`, completionLeaseExpiresAt: null } })
+        return res.status(410).json({ code: 'S3_UPLOAD_EXPIRED', message: 'The completed object failed size verification. Start the upload again.' })
+      }
+      if (loaded.session.completionLeaseExpiresAt && loaded.session.completionLeaseExpiresAt > new Date()) return res.json({ status: 'completing', parts: [], partSize, partCount, retryAfterMs: 2000 })
+      await prisma.uploadSession.updateMany({ where: { id: loaded.session.id, status: 'completing', completionLeaseExpiresAt: loaded.session.completionLeaseExpiresAt }, data: { status: 'uploading', completionLeaseExpiresAt: null } })
+    }
+    try {
+      return res.json({ status: 'uploading', parts: await listS3UploadedParts(loaded.config, loaded.objectKey, loaded.uploadId), partSize, partCount })
+    } catch (error) {
+      const code = (error as { Code?: string; name?: string; $metadata?: { httpStatusCode?: number } }).Code ?? (error as { name?: string }).name
+      const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
+      if (code === 'NoSuchUpload' || code === 'NoSuchUploadException') {
+        await prisma.uploadSession.updateMany({ where: { id: loaded.session.id, status: { in: ['uploading', 'completing'] } }, data: { status: 'failed', errorMessage: 'S3 multipart session expired.', completionLeaseExpiresAt: null } })
+        return res.status(410).json({ code: 'S3_UPLOAD_EXPIRED', message: 'This S3 multipart session expired. Start the upload again.' })
+      }
+      throw error
+    }
   } catch (error) {
     return next(error)
   }
@@ -713,33 +808,52 @@ uploadRouter.post('/s3/:id/complete', requireAuth, async (req: AuthRequest, res,
       const existing = await prisma.file.findFirst({ where: { userId: req.user!.id, provider: 's3', providerFileId: objectKey } })
       if (existing) return res.json({ status: 'completed', file: { ...existing, sizeBytes: existing.sizeBytes.toString() } })
     }
-    if (session.status !== 'uploading') return res.status(409).json({ code: 'UPLOAD_SESSION_CLOSED', message: `This upload is ${session.status}.` })
+    if (session.status === 'completing' || session.status === 'uploading' || session.status === 'completed') {
+      const remoteSize = await headS3ObjectSize(config, objectKey)
+      if (remoteSize !== null) {
+        if (remoteSize !== session.sizeBytes) {
+          await deleteS3Key(config, objectKey).catch(() => undefined)
+          await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: `Stored ${remoteSize} bytes, expected ${session.sizeBytes}.`, completionLeaseExpiresAt: null } })
+          return res.status(400).json({ code: 'UPLOAD_SIZE_MISMATCH', message: 'The uploaded file is not the size that was announced.' })
+        }
+        const file = await recordCompletedS3Upload(session, account, objectKey)
+        return res.json({ status: 'completed', file: { ...file, sizeBytes: file.sizeBytes.toString() } })
+      }
+    }
+    if (!mayClaimMultipartCompletion(session.status, session.completionLeaseExpiresAt)) return res.status(409).json({ code: 'UPLOAD_COMPLETION_IN_PROGRESS', message: 'This upload is still being completed. Retry in a moment.' })
 
     const parts = completedPartsInOrder(body.parts, s3PartCount(session.sizeBytes, s3PartSize(session.sizeBytes)))
     if (!parts) return res.status(400).json({ code: 'INVALID_PARTS', message: 'Every part must be listed once, with its ETag.' })
 
     // Claim the session so two complete calls can't both create the File row.
-    const claimed = await prisma.uploadSession.updateMany({ where: { id: session.id, status: 'uploading' }, data: { status: 'completing' } })
+    const leaseUntil = new Date(Date.now() + 90_000)
+    const claimed = await prisma.uploadSession.updateMany({ where: { id: session.id, status: session.status, completionLeaseExpiresAt: session.completionLeaseExpiresAt }, data: { status: 'completing', completionLeaseExpiresAt: leaseUntil } })
     if (claimed.count === 0) return res.status(409).json({ code: 'UPLOAD_SESSION_CLOSED', message: 'This upload is already being completed.' })
     let storedBytes: bigint
     try {
       storedBytes = await completeS3MultipartUpload(config, objectKey, uploadId, parts)
     } catch (error) {
-      await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'uploading' } })
-      throw error
+      let reconciledSize: bigint | null
+      try {
+        reconciledSize = await headS3ObjectSize(config, objectKey)
+      } catch {
+        // Keep the lease until expiry when the object state is unknown; the retry route will
+        // reconcile it instead of starting a second provider completion during an outage.
+        throw error
+      }
+      if (reconciledSize === null) {
+        await prisma.uploadSession.updateMany({ where: { id: session.id, status: 'completing', completionLeaseExpiresAt: leaseUntil }, data: { status: 'uploading', completionLeaseExpiresAt: null } })
+        throw error
+      }
+      storedBytes = reconciledSize
     }
     if (storedBytes !== session.sizeBytes) {
       await deleteS3Key(config, objectKey).catch(() => undefined)
-      await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: `Stored ${storedBytes} bytes, expected ${session.sizeBytes}.` } })
+      await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: `Stored ${storedBytes} bytes, expected ${session.sizeBytes}.`, completionLeaseExpiresAt: null } })
       return res.status(400).json({ code: 'UPLOAD_SIZE_MISMATCH', message: 'The uploaded file is not the size that was announced.' })
     }
 
-    const file = await prisma.file.create({
-      data: { userId: req.user!.id, connectedAccountId: account.id, folderId: session.folderId, provider: 's3', providerFileId: objectKey, name: session.fileName, mimeType: session.mimeType, sizeBytes: session.sizeBytes, status: 'active' },
-    })
-    await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'completed', completedAt: new Date() } })
-    await auditUpload(req.user!.id, file, file.sizeBytes, account)
-    syncS3Quota(account.id).catch(() => undefined)
+    const file = await recordCompletedS3Upload(session, account, objectKey)
     return res.status(201).json({ status: 'completed', file: { ...file, sizeBytes: file.sizeBytes.toString() } })
   } catch (error) {
     return next(error)

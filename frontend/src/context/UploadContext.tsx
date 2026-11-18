@@ -3,7 +3,7 @@ import { isDesktop } from '@/lib/runtime'
 import { DesktopUploadProvider } from '@/context/DesktopUploadProvider'
 import type { PickedFile } from '@/lib/desktop'
 import { resolveUploadFolder as resolveFolderPath } from '@/lib/upload-folders'
-import { getApiUrl, apiFetch, authedFetch, refreshAccessToken } from '@/lib/api'
+import { ApiError, getApiUrl, apiFetch, authedFetch, refreshAccessToken } from '@/lib/api'
 import { clearAuthSession, getAccessToken } from '@/lib/auth'
 
 export type UploadProgressStatus = 'queued' | 'uploading' | 'paused' | 'done' | 'error' | 'partial'
@@ -147,7 +147,7 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
         }
         sessionId = initData.sessionId
         setResumableSessions(prev => ({ ...prev, [uploadId]: { sessionId, file, folderId, targetAccountId } }))
-        await uploadBrowserS3Parts(sessionId, file, initData.partSize, initData.partCount, onProgress)
+        await uploadBrowserS3Parts(uploadId, sessionId, file, folderId, targetAccountId, initData.partSize, initData.partCount, onProgress)
         return
       }
       if (!initData.sessionId) throw new Error('Upload session was not created')
@@ -159,9 +159,16 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
         [uploadId]: { sessionId, file, folderId, targetAccountId }
       }))
     } else {
-      const s3Status = await apiFetch<{ status: string; partSize: number; partCount: number }>(`/uploads/s3/${sessionId}/parts`).catch(() => null)
+      const s3Status = await apiFetch<{ status: string; partSize: number; partCount: number }>(`/uploads/s3/${sessionId}/parts`).catch((error) => {
+        if (error instanceof ApiError && error.code === 'S3_UPLOAD_EXPIRED') return { status: 'expired', partSize: 0, partCount: 0 }
+        return null
+      })
+      if (s3Status?.status === 'expired') {
+        await restartExpiredS3Upload(uploadId, file, folderId, targetAccountId, onProgress)
+        return
+      }
       if (s3Status) {
-        await uploadBrowserS3Parts(sessionId, file, s3Status.partSize, s3Status.partCount, onProgress)
+        await uploadBrowserS3Parts(uploadId, sessionId, file, folderId, targetAccountId, s3Status.partSize, s3Status.partCount, onProgress)
         return
       }
       const statusData = await apiFetch<{ status: string; offset: string; chunkSize?: number }>(`/uploads/resumable/status/${sessionId}`)
@@ -233,8 +240,33 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function uploadBrowserS3Parts(sessionId: string, file: File, partSize: number, partCount: number, onProgress: (percent: number) => void) {
-    const status = await apiFetch<{ status: string; parts: Array<{ partNumber: number; etag: string; size: number }> }>(`/uploads/s3/${sessionId}/parts`)
+  async function restartExpiredS3Upload(uploadId: string, file: File, folderId: string | null, targetAccountId: string | null | undefined, onProgress: (percent: number) => void) {
+    const initData = await apiFetch<{ sessionId?: string; provider: string; accountId?: string; accountLabel?: string; partSize?: number; partCount?: number }>('/uploads/resumable/init', {
+      method: 'POST',
+      body: JSON.stringify({ fileName: file.name, mimeType: file.type || 'application/octet-stream', sizeBytes: String(file.size), folderId: folderId || undefined, targetAccountId: targetAccountId || undefined, chunkedProxy: true }),
+    })
+    if (initData.provider !== 's3' || !initData.sessionId || !initData.partSize || !initData.partCount) throw new Error('S3 created a replacement session that this browser cannot resume.')
+    const sessionId = initData.sessionId
+    setResumableSessions((current) => ({ ...current, [uploadId]: { sessionId, file, folderId, targetAccountId } }))
+    if (initData.accountLabel) updateFileProgress(uploadId, { accountLabel: initData.accountLabel })
+    await uploadBrowserS3Parts(uploadId, sessionId, file, folderId, targetAccountId, initData.partSize, initData.partCount, onProgress)
+  }
+
+  async function uploadBrowserS3Parts(uploadId: string, sessionId: string, file: File, folderId: string | null, targetAccountId: string | null | undefined, partSize: number, partCount: number, onProgress: (percent: number) => void) {
+    let status: { status: string; parts: Array<{ partNumber: number; etag: string; size: number }> }
+    try { status = await apiFetch(`/uploads/s3/${sessionId}/parts`) }
+    catch (error) {
+      if (error instanceof ApiError && error.code === 'S3_UPLOAD_EXPIRED') return restartExpiredS3Upload(uploadId, file, folderId, targetAccountId, onProgress)
+      throw error
+    }
+    for (let check = 0; status.status === 'completing' && check < 15; check++) {
+      await sleep(2000)
+      try { status = await apiFetch(`/uploads/s3/${sessionId}/parts`) }
+      catch (error) {
+        if (error instanceof ApiError && error.code === 'S3_UPLOAD_EXPIRED') return restartExpiredS3Upload(uploadId, file, folderId, targetAccountId, onProgress)
+        throw error
+      }
+    }
     if (status.status === 'completed') { onProgress(100); return }
     if (status.status !== 'uploading') throw new Error(`S3 upload is ${status.status}`)
     const parts = new Map(status.parts.map((part) => [part.partNumber, part.etag]))
@@ -259,7 +291,24 @@ function WebUploadProvider({ children }: { children: ReactNode }) {
       if (lastError) throw lastError
       onProgress(Math.min(99, Math.round((parts.size / partCount) * 100)))
     }
-    await apiFetch(`/uploads/s3/${sessionId}/complete`, { method: 'POST', body: JSON.stringify({ parts: [...parts].sort(([a], [b]) => a - b).map(([partNumber, etag]) => ({ partNumber, etag })) }) })
+    try {
+      await apiFetch(`/uploads/s3/${sessionId}/complete`, { method: 'POST', body: JSON.stringify({ parts: [...parts].sort(([a], [b]) => a - b).map(([partNumber, etag]) => ({ partNumber, etag })) }) })
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== 'UPLOAD_COMPLETION_IN_PROGRESS') throw error
+      for (let check = 0; check < 15; check++) {
+        await sleep(2000)
+        try {
+          const current = await apiFetch<{ status: string }>(`/uploads/s3/${sessionId}/parts`)
+          if (current.status === 'completed') { onProgress(100); return }
+          if (current.status === 'uploading') throw error
+        } catch (retryError) {
+          if (retryError instanceof ApiError && retryError.code === 'S3_UPLOAD_EXPIRED') return restartExpiredS3Upload(uploadId, file, folderId, targetAccountId, onProgress)
+          if (retryError === error) throw retryError
+          throw retryError
+        }
+      }
+      throw new Error('S3 is still finalizing this upload. Retry the upload to reconcile it.')
+    }
     onProgress(100)
   }
 

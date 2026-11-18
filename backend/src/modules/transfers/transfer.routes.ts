@@ -3,7 +3,8 @@ import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
-import { storageProvider, assertProviderCapability } from '../storage-providers/provider.js'
+import { storageProvider } from '../storage-providers/provider.js'
+import { assertTransferCapabilities } from './transfer-capabilities.js'
 import { assertTransferJobTransition } from './transfer-state.js'
 import { keepBothName } from './conflict-name.js'
 import { createReplicationRun } from './replication-run.js'
@@ -35,8 +36,7 @@ transferRouter.post('/plans', async (req: AuthRequest, res, next) => {
     const source = accounts.find((account) => account.id === body.sourceAccountId)
     const destination = accounts.find((account) => account.id === body.destinationAccountId)
     if (!source || !destination) return res.status(404).json({ code: 'ACCOUNT_NOT_FOUND', message: 'Source or destination account was not found.' })
-    assertProviderCapability(storageProvider(source.provider), 'download')
-    assertProviderCapability(storageProvider(destination.provider), 'upload')
+    assertTransferCapabilities(storageProvider(source.provider), storageProvider(destination.provider), 'replicate')
     const plan = await prisma.replicationPlan.create({ data: { userId: req.user!.id, name: body.name, sourceConnectedAccountId: source.id, destinationConnectedAccountId: destination.id, scheduleCron: body.scheduleCron, nextRunAt: body.scheduleCron ? nextReplicationRun(body.scheduleCron, new Date()) : null } })
     return res.status(201).json({ plan })
   } catch (error) { return next(error) }
@@ -81,11 +81,11 @@ transferRouter.post('/', async (req: AuthRequest, res, next) => {
     const source = accounts.find((account) => account.id === body.sourceAccountId)
     const destination = accounts.find((account) => account.id === body.destinationAccountId)
     if (!source || !destination) return res.status(404).json({ code: 'ACCOUNT_NOT_FOUND', message: 'Source or destination account was not found.' })
-    assertProviderCapability(storageProvider(source.provider), 'download')
-    assertProviderCapability(storageProvider(destination.provider), 'upload')
+    assertTransferCapabilities(storageProvider(source.provider), storageProvider(destination.provider), body.kind)
     const ids = [...new Set(body.fileIds)]
     const files = await prisma.file.findMany({ where: { id: { in: ids }, userId: req.user!.id, connectedAccountId: source.id, status: 'active' } })
     if (files.length !== ids.length) return res.status(400).json({ code: 'FILES_NOT_FOUND', message: 'Every selected file must belong to the source account.' })
+    for (const file of files) assertTransferCapabilities(storageProvider(source.provider), storageProvider(destination.provider), body.kind, file.sizeBytes)
     const maxUpload = storageProvider(destination.provider).capabilities.maxUploadBytes
     if (maxUpload !== null && files.some((file) => file.sizeBytes > maxUpload)) return res.status(400).json({ code: 'PROVIDER_FILE_TOO_LARGE', message: 'A source file exceeds the destination provider limit.' })
     const existingNames = new Set((await prisma.file.findMany({ where: { userId: req.user!.id, connectedAccountId: destination.id, status: 'active' }, select: { name: true } })).map((file) => file.name))

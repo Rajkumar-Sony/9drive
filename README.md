@@ -195,7 +195,15 @@ RECAPTCHA_SECRET_KEY=""
 GOOGLE_CLIENT_ID=""
 GOOGLE_CLIENT_SECRET=""
 GOOGLE_REDIRECT_URI="http://localhost:4000/connected-accounts/google/callback"
+
+TELEGRAM_BOT_API_BASE_URL="https://api.telegram.org"
+TELEGRAM_BOT_API_LOCAL_MODE=false
+# Optional, required for personal Telegram Saved Messages (MTProto).
+TELEGRAM_API_ID=""
+TELEGRAM_API_HASH=""
 ```
+
+Telegram MTProto needs both server-side `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`; without them, Saved Messages login reports that server configuration is missing. Bot tokens are encrypted by the server. The optional client-side vault encrypts content and file details in the browser and requires a separate recovery key to be kept by the user.
 
 Create `frontend/.env`:
 
@@ -211,7 +219,7 @@ Then run `npm run prisma:migrate` in `backend/` and start both dev servers as sh
 ### Your first five minutes
 
 1. Open http://localhost:5173 and **register**, or use **Continue with Google** (this connects your first Drive automatically).
-2. Go to **Settings → Connect Drive** to add more Google accounts, or **Connect S3** to add a bucket.
+2. Go to **Accounts & quota** to connect Google Drive, OneDrive, S3-compatible storage, or Telegram Bot / Saved Messages storage.
 3. Open **Quota Tracker** to see your combined storage and choose an upload routing mode.
 4. Go to **All Files**, create a folder, and upload something. Watch the progress panel in the corner.
 5. Right-click the file and choose **Share Link**, then open the link in a private window.

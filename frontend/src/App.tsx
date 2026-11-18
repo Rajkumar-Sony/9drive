@@ -25,7 +25,9 @@ import { DesktopLoginPage } from '@/pages/DesktopLoginPage'
 import { DownloadAppPage } from '@/pages/DownloadAppPage'
 import { DesktopBridge } from '@/components/desktop/DesktopBridge'
 import { getServerUrl, isDesktop } from '@/lib/runtime'
-import { useState } from 'react'
+import { lazy, Suspense, useState } from 'react'
+
+const VaultPage = lazy(() => import('@/pages/VaultPage').then((module) => ({ default: module.VaultPage })))
 
 
 function App() {
@@ -60,6 +62,7 @@ function App() {
           <Route path="trash" element={<TrashPage />} />
           <Route path="activity" element={<ActivityLogPage />} />
           <Route path="transfers" element={<TransfersPage />} />
+          <Route path="vault" element={<Suspense fallback={<div className="p-6 text-sm text-muted">Opening encrypted vault…</div>}><VaultPage /></Suspense>} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="api" element={<ApiManagementPage />} />
         </Route>

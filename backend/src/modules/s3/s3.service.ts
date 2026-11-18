@@ -131,6 +131,18 @@ export async function completeS3MultipartUpload(config: S3Config, key: string, u
   return BigInt(head.ContentLength ?? 0)
 }
 
+export async function headS3ObjectSize(config: S3Config, key: string): Promise<bigint | null> {
+  try {
+    const head = await createS3Client(config).send(new HeadObjectCommand({ Bucket: config.bucket, Key: key }))
+    return head.ContentLength === undefined ? null : BigInt(head.ContentLength)
+  } catch (error) {
+    const name = (error as { name?: string }).name
+    const code = (error as { Code?: string }).Code
+    if (name === 'NotFound' || name === 'NoSuchKey' || code === 'NoSuchKey' || code === 'NotFound' || code === '404') return null
+    throw error
+  }
+}
+
 export async function abortS3MultipartUpload(config: S3Config, key: string, uploadId: string) {
   await createS3Client(config).send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: key, UploadId: uploadId }))
 }

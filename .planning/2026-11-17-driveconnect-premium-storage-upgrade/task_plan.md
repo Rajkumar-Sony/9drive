@@ -29,7 +29,13 @@ Implement the approved provider, upload, transfer, job, folder-upload, Telegram,
 - Telegram Bot is limited by configured Bot API mode; MTProto is rate-limited, session-scoped, and uses its own client credentials.
 
 ## Current status
-- Phase: Tasks 2–5 in progress; Tasks 6–7 pending. OneDrive code is present but not live-authorized; Telegram adapters remain pending.
+- Phase: Tasks 1–6 have implementation code; Task 7 acceptance is in progress. Code presence does not mean provider-backed flows or production acceptance passed.
+- Task 2: MySQL worker and lease/fencing code are present; concurrent-worker claims and crash-recovery acceptance still need an isolated database test.
+- Task 3: OneDrive, Telegram Bot API, and Telegram MTProto adapters/account flows are present. Bot tokens use syntax validation and redirect rejection; Live provider credential flows remain unverified. Telegram-Drive is a design reference only; no source was copied.
+- Task 4: resumable browser S3, OneDrive uploads, web/Tauri folder preservation, and provider limits are implemented. Real-bucket interrupted/expired/cancelled multipart tests remain pending.
+- Task 5: transfers, replication schedules, progress events and controls are implemented; cloud-backed copy/move/replication and failure races remain unverified.
+- Task 6: vault crypto, ciphertext-only upload/list, opaque transfer metadata, lock/recovery/upload/download/preview UI are present; browser/PWA and desktop acceptance remains pending.
+- Task 7: backend/frontend tests and builds pass; MySQL worker claim/recovery, Drive sync, and share authorization/isolation integration tests passed on disposable scratch databases. Real provider credentials, browser/PWA and packaged desktop E2E, test-bucket S3 failure scenarios, and operational hardening remain open. Master Test remains **NOT READY**.
 - Approved detailed plan: conversation turn immediately before implementation request.
 - Base checkout: `/Users/pb0595/Documents/Projects/SaaS/oneconnect`.
 - See progress.md for completed code and verification; database-backed runtime checks are pending.

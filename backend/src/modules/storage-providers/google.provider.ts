@@ -13,7 +13,11 @@ export const googleProvider: StorageProvider = {
   streamFile: streamGoogleFile,
   async deleteFile(file) {
     const auth = await getAuthedGoogleClient(file.connectedAccount)
-    await google.drive({ version: 'v3', auth }).files.delete({ fileId: file.providerFileId })
+    try {
+      await google.drive({ version: 'v3', auth }).files.delete({ fileId: file.providerFileId })
+    } catch (error) {
+      if ((error as { code?: number }).code !== 404) throw error
+    }
   },
   async openDownload(file) {
     const auth = await getAuthedGoogleClient(file.connectedAccount)

@@ -6,6 +6,7 @@ import { assertTransferJobTransition } from './transfer-state.js'
 import { createReplicationRun } from './replication-run.js'
 import { REPLICATION_SCHEDULES, nextReplicationRun, type ReplicationSchedule } from './replication-schedule.js'
 import { HttpError } from '../../middleware/error.middleware.js'
+import { providerRetryAfterMs } from './transfer-retry.js'
 
 const LEASE_MS = 120_000
 const IDLE_MS = 1_500
@@ -38,7 +39,7 @@ export async function scheduleDueReplication() {
   }
 }
 
-async function claimNextJob(workerId: string) {
+export async function claimNextJob(workerId: string) {
   return prisma.$transaction(async (tx) => {
     const rows = await tx.$queryRaw<ClaimedJob[]>`
       SELECT id, fencing_token FROM transfer_jobs
@@ -69,7 +70,7 @@ async function isCurrentLease(jobId: string, workerId: string, fencingToken: big
 
 async function processItem(jobId: string, itemId: string, workerId: string, fencingToken: bigint) {
   const item = await prisma.transferJobItem.findUniqueOrThrow({
-    where: { id: itemId }, include: { sourceFile: { include: { connectedAccount: true } }, job: { include: { destinationConnectedAccount: true } } },
+    where: { id: itemId }, include: { sourceFile: { include: { connectedAccount: true, vaultObject: true } }, job: { include: { destinationConnectedAccount: true } } },
   })
   if (item.status === 'completed') return
   if (!(await isCurrentLease(jobId, workerId, fencingToken))) return
@@ -79,6 +80,15 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
   const sourceProvider = storageProvider(item.sourceFile.provider)
   const destinationProvider = storageProvider(item.job.destinationConnectedAccount.provider)
   const source = { ...item.sourceFile, connectedAccount: item.sourceFile.connectedAccount }
+  const copyVaultEnvelope = async (destinationFileId: string) => {
+    const encrypted = item.sourceFile.vaultObject
+    if (!encrypted) return
+    await prisma.vaultObject.upsert({
+      where: { fileId: destinationFileId },
+      create: { userId: item.job.userId, fileId: destinationFileId, formatVersion: encrypted.formatVersion, encryptedMetadata: encrypted.encryptedMetadata, salt: encrypted.salt, keyWrap: encrypted.keyWrap, encryptionAlgorithm: encrypted.encryptionAlgorithm },
+      update: { formatVersion: encrypted.formatVersion, encryptedMetadata: encrypted.encryptedMetadata, salt: encrypted.salt, keyWrap: encrypted.keyWrap, encryptionAlgorithm: encrypted.encryptionAlgorithm },
+    })
+  }
   const recordReplication = async (destinationProviderId: string, checksum: string | null) => {
     if (!item.job.replicationPlanId) return
     await prisma.replicationMapping.upsert({
@@ -90,6 +100,7 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
   if (item.destinationFileId && item.destinationProviderId) {
     const recorded = await prisma.file.findFirst({ where: { id: item.destinationFileId, userId: item.job.userId, connectedAccountId: item.job.destinationConnectedAccountId, providerFileId: item.destinationProviderId, status: 'active' }, include: { connectedAccount: true } })
     if (!recorded) throw new Error('Recorded destination file is missing; source will not be deleted.')
+    await copyVaultEnvelope(recorded.id)
     if (item.job.kind === 'move' && item.sourceFile.status === 'active') {
       const remote = await destinationProvider.openDownload(recorded)
       const verifiedHash = createHash('sha256')
@@ -152,6 +163,7 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
     },
     update: { providerFileId: destination.providerFileId, status: 'active', deletedAt: null, checksum: digest },
   })
+  await copyVaultEnvelope(file.id)
   await prisma.transferJobItem.update({
     where: { id: item.id },
     data: { status: 'uploaded', destinationProviderId: destination.providerFileId, destinationFileId: file.id, checksum: digest, bytesTransferred: bytes, lastError: null },
@@ -170,6 +182,7 @@ async function processItem(jobId: string, itemId: string, workerId: string, fenc
 }
 
 async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigint) {
+  let providerRetryDelayMs = 0
   const heartbeat = setInterval(() => {
     void prisma.transferJob.updateMany({
       where: { id: jobId, status: { in: ['running', 'cancelling'] }, leaseOwner: workerId, fencingToken },
@@ -186,6 +199,7 @@ async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigi
         await processItem(jobId, item.id, workerId, fencingToken)
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Transfer failed.'
+        providerRetryDelayMs = Math.max(providerRetryDelayMs, providerRetryAfterMs(error) ?? 0)
         await prisma.transferJobItem.update({ where: { id: item.id }, data: { status: 'failed', lastError: message.slice(0, 2000) } }).catch(() => undefined)
       }
     }
@@ -200,7 +214,7 @@ async function runClaimedJob(jobId: string, workerId: string, fencingToken: bigi
     assertTransferJobTransition(job.status, status)
     await prisma.transferJob.updateMany({
       where: { id: jobId, status: job.status, leaseOwner: workerId, fencingToken },
-      data: { status, completedItems, failedItems, totalItems, lastError: failedItems ? 'One or more transfer items failed.' : null, completedAt: ['completed', 'cancelled', 'dead_letter'].includes(status) ? new Date() : null, leaseOwner: null, leaseExpiresAt: null, ...(status === 'queued' ? { availableAt: new Date(Date.now() + Math.min(60_000, 1_000 * 2 ** job.attemptCount)) } : {}) },
+      data: { status, completedItems, failedItems, totalItems, lastError: failedItems ? 'One or more transfer items failed.' : null, completedAt: ['completed', 'cancelled', 'dead_letter'].includes(status) ? new Date() : null, leaseOwner: null, leaseExpiresAt: null, ...(status === 'queued' ? { availableAt: new Date(Date.now() + Math.max(Math.min(60_000, 1_000 * 2 ** job.attemptCount), providerRetryDelayMs)) } : {}) },
     })
   } finally {
     clearInterval(heartbeat)

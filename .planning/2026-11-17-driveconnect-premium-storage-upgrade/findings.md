@@ -26,11 +26,23 @@
 - Telegram MTProto file parts have protocol constraints and may expire; handle flood waits and reauthentication without claiming unlimited durable resume.
 - MySQL 8.4 documents `SKIP LOCKED` as applicable to queue-like row claiming.
 - Google Drive and Microsoft Graph have distinct resumable-session rules; S3 multipart must reconcile parts and complete/abort explicitly.
-- libsodium.js secretstream and Argon2id selected for client-side vault design; GramJS selected for MTProto after deployment-owned Telegram API credentials are configured.
+- libsodium.js secretstream and Argon2id selected for client-side vault design; `teleproto` is used for MTProto with server-configured API ID/hash and encrypted user sessions. The reference [Telegram-Drive](https://github.com/caamer20/Telegram-Drive) informed Saved Messages as the default destination, bounded streaming, retry/flood-wait awareness, and explicit account ownership; no reference source code was copied. Real Telegram credentials and account flows remain unverified.
 - iLyeseia source license is Apache-2.0; BlackOctal has no LICENSE file found. No source code will be copied.
 
 ## Rulings
 - Use a common capability contract with provider-specific upload/session implementations; do not force providers to pretend they support unsupported operations.
+- Provider capabilities are enforced at stream and batch-download entrypoints as well as transfer creation. The Local Bot API mode is upload-only until a shared-volume adapter exists, because the API can return absolute local file paths that the service cannot safely read.
+- Telegram Bot API credentials are validated against token syntax, and API calls reject redirects so the token-bearing request URL is not forwarded to another host.
 - Use MySQL as source of truth for both jobs and checkpoints; use lease generation/fencing to make multiple worker containers safe.
 - Keep interactive replacements out of unattended recurring runs; they transition to `needs_input`.
 - Use a client-keyed identity for vault duplicate checks; no plaintext digest reaches the backend.
+
+## Master Test checkpoint — 2026-11-18
+- Fresh backend `npm test`: build passed; 17 tests passed, 11 database-backed tests skipped, 0 failed. Skips include Drive sync integration without `DRIVE_SYNC_TEST_DATABASE_URL` and share protection integration.
+- Fresh frontend `node --test tests/*.test.ts`: 9 passed, 0 failed.
+- Fresh frontend web and desktop builds passed. Vite reports ineffective dynamic imports for desktop modules; output still builds successfully.
+- `git diff --check` passed. Unrelated branding edits and generated brand-kit files remain uncommitted and must be preserved.
+- Status remains **NOT READY**. The checklist below is based on implementation and evidence recorded in this ledger, not feature labels or build success.
+- Still unimplemented: Telegram Bot API and MTProto storage/account flows; zero-knowledge vault crypto and UI.
+- Implemented but incompletely verified: cross-account copy/move, scheduled replication, S3 multipart, desktop folder selection, OneDrive discovery, cancellation recovery. Missing high-risk acceptance includes live provider flows, S3 interruption/expiry/cancel reconciliation, two-user auth/isolation tests, worker crash/fencing races, packaged desktop/browser E2E, and full security/operational validation.
+- No production penetration test, load/soak test, or external credential-backed acceptance was performed in this checkpoint.

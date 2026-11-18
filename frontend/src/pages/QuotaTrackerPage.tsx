@@ -29,6 +29,7 @@ type RoutingPolicy = { mode: RoutingMode; priorityAccountIds: string[] }
 
 const DANGER_THRESHOLD = 85
 const EMPTY_S3 = { name: '', bucket: '', region: 'us-east-1', endpoint: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: false, quotaBytes: '' }
+const EMPTY_TELEGRAM_BOT = { botToken: '', chatId: '' }
 
 const ROUTING_OPTIONS: { mode: RoutingMode; title: string; description: string }[] = [
   { mode: 'most_available', title: 'Most free space', description: 'Send each upload to the account with the most free space.' },
@@ -83,6 +84,17 @@ export function QuotaTrackerPage() {
   const [s3Form, setS3Form] = useState(EMPTY_S3)
   const [s3Error, setS3Error] = useState('')
   const [connectingS3, setConnectingS3] = useState(false)
+  const [telegramBotOpen, setTelegramBotOpen] = useState(false)
+  const [telegramBotForm, setTelegramBotForm] = useState(EMPTY_TELEGRAM_BOT)
+  const [telegramBotError, setTelegramBotError] = useState('')
+  const [connectingTelegram, setConnectingTelegram] = useState(false)
+  const [telegramMtprotoOpen, setTelegramMtprotoOpen] = useState(false)
+  const [telegramPhone, setTelegramPhone] = useState('')
+  const [telegramCode, setTelegramCode] = useState('')
+  const [telegramPassword, setTelegramPassword] = useState('')
+  const [telegramChallengeId, setTelegramChallengeId] = useState('')
+  const [telegramNeedsPassword, setTelegramNeedsPassword] = useState(false)
+  const [telegramError, setTelegramError] = useState('')
   const [oneDriveOpen, setOneDriveOpen] = useState(false)
   const [oneDriveClientId, setOneDriveClientId] = useState('')
   const [oneDriveClientSecret, setOneDriveClientSecret] = useState('')
@@ -181,6 +193,52 @@ export function QuotaTrackerPage() {
     }
   }
 
+  async function connectTelegramBot(event: FormEvent) {
+    event.preventDefault()
+    setConnectingTelegram(true)
+    setTelegramBotError('')
+    try {
+      await apiFetch('/connected-accounts/telegram/bot', { method: 'POST', body: JSON.stringify(telegramBotForm) })
+      setTelegramBotOpen(false)
+      setTelegramBotForm(EMPTY_TELEGRAM_BOT)
+      setMessage('Telegram bot storage connected.')
+      await load()
+      notifyStorageChanged()
+    } catch (cause) { setTelegramBotError(cause instanceof Error ? cause.message : 'Telegram bot connection failed.') }
+    finally { setConnectingTelegram(false) }
+  }
+
+  async function connectTelegramMtproto(event: FormEvent) {
+    event.preventDefault()
+    setConnectingTelegram(true)
+    setTelegramError('')
+    try {
+      if (!telegramChallengeId) {
+        const result = await apiFetch<{ challengeId: string }>('/connected-accounts/telegram/mtproto/start', { method: 'POST', body: JSON.stringify({ phone: telegramPhone }) })
+        setTelegramChallengeId(result.challengeId)
+        setMessage('Telegram sent a login code. Enter it here to finish connecting.')
+        return
+      }
+      const result = await apiFetch<{ status: string; challengeId?: string }>('/connected-accounts/telegram/mtproto/finish', { method: 'POST', body: JSON.stringify({ challengeId: telegramChallengeId, code: telegramNeedsPassword ? undefined : telegramCode, password: telegramNeedsPassword ? telegramPassword : undefined }) })
+      if (result.status === 'password_required') {
+        setTelegramNeedsPassword(true)
+        setTelegramCode('')
+        setMessage('Enter your Telegram two-step verification password.')
+        return
+      }
+      setTelegramMtprotoOpen(false)
+      setTelegramChallengeId('')
+      setTelegramCode('')
+      setTelegramPassword('')
+      setTelegramPhone('')
+      setTelegramNeedsPassword(false)
+      setMessage('Telegram Saved Messages connected.')
+      await load()
+      notifyStorageChanged()
+    } catch (cause) { setTelegramError(cause instanceof Error ? cause.message : 'Telegram connection failed.') }
+    finally { setConnectingTelegram(false) }
+  }
+
   async function connectOneDrive(event: FormEvent) {
     event.preventDefault()
     setConnecting(true)
@@ -266,6 +324,8 @@ export function QuotaTrackerPage() {
   const connectActions = (
     <>
       <Button variant="secondary" onClick={() => { setS3Error(''); setS3Open(true) }}><Database className="h-4 w-4" strokeWidth={1.5} />Connect S3</Button>
+      <Button variant="secondary" onClick={() => { setTelegramBotError(''); setTelegramBotOpen(true) }}>Connect Telegram bot</Button>
+      <Button variant="secondary" onClick={() => { setTelegramError(''); setTelegramMtprotoOpen(true) }}>Connect Telegram account</Button>
       <Button variant="secondary" onClick={() => setOneDriveOpen(true)}>Connect OneDrive</Button>
       <Button onClick={connectDrive} disabled={connecting}><Cloud className="h-4 w-4" strokeWidth={1.5} />{connecting ? 'Opening...' : 'Connect Google Drive'}</Button>
     </>
@@ -283,6 +343,22 @@ export function QuotaTrackerPage() {
       <PageHeader title="Accounts & quota" description="Connected storage, capacity, and where new uploads go." actions={connectActions} />
       <Dialog open={oneDriveOpen} onClose={() => setOneDriveOpen(false)} title="Connect OneDrive" width={520} footer={<><Button variant="secondary" onClick={() => setOneDriveOpen(false)}>Cancel</Button><Button type="submit" form="onedrive-connect-form" disabled={connecting || !oneDriveClientId || !oneDriveClientSecret}>Continue to Microsoft</Button></>}>
         <form id="onedrive-connect-form" onSubmit={(event) => void connectOneDrive(event)} className="grid gap-3 text-sm text-text"><p>Register a web app in Microsoft Entra, then add this redirect URI:</p><code className="break-all rounded-md bg-bg p-2 text-xs">{oneDriveRedirectUri}</code><label className="grid gap-1">Application (client) ID<Input value={oneDriveClientId} onChange={(event) => setOneDriveClientId(event.target.value)} required /></label><label className="grid gap-1">Client secret<Input type="password" value={oneDriveClientSecret} onChange={(event) => setOneDriveClientSecret(event.target.value)} required /></label><p className="text-xs text-muted">Permissions: offline_access, User.Read, Files.ReadWrite. The secret is encrypted by the server.</p></form>
+      </Dialog>
+      <Dialog open={telegramBotOpen} onClose={() => setTelegramBotOpen(false)} title="Connect Telegram bot storage" width={520} footer={<><Button variant="secondary" onClick={() => setTelegramBotOpen(false)} disabled={connectingTelegram}>Cancel</Button><Button type="submit" form="telegram-bot-connect-form" disabled={connectingTelegram}>{connectingTelegram ? 'Checking bot…' : 'Connect bot'}</Button></>}>
+        <form id="telegram-bot-connect-form" onSubmit={(event) => void connectTelegramBot(event)} className="grid gap-3 text-sm text-text">
+          <p className="text-muted">Create a bot with BotFather, add it to a chat, and give it permission to send documents. The bot token is encrypted by oneconnect and never returned to the browser.</p>
+          <label className="grid gap-1">Bot token<Input type="password" autoComplete="new-password" value={telegramBotForm.botToken} onChange={(event) => setTelegramBotForm({ ...telegramBotForm, botToken: event.target.value })} required /></label>
+          <label className="grid gap-1">Chat ID or username<Input value={telegramBotForm.chatId} onChange={(event) => setTelegramBotForm({ ...telegramBotForm, chatId: event.target.value })} required /></label>
+          <p className="text-xs text-muted">Telegram Bot API storage has provider file-size limits and does not report quota or reliably support long-term deletion.</p>
+          {telegramBotError ? <p role="alert" className="text-danger">{telegramBotError}</p> : null}
+        </form>
+      </Dialog>
+      <Dialog open={telegramMtprotoOpen} onClose={() => { setTelegramMtprotoOpen(false); setTelegramChallengeId(''); setTelegramNeedsPassword(false) }} title="Connect Telegram Saved Messages" width={520} footer={<><Button variant="secondary" onClick={() => { setTelegramMtprotoOpen(false); setTelegramChallengeId(''); setTelegramNeedsPassword(false) }} disabled={connectingTelegram}>Cancel</Button><Button type="submit" form="telegram-mtproto-connect-form" disabled={connectingTelegram}>{connectingTelegram ? 'Connecting…' : telegramChallengeId ? 'Verify and connect' : 'Send login code'}</Button></>}>
+        <form id="telegram-mtproto-connect-form" onSubmit={(event) => void connectTelegramMtproto(event)} className="grid gap-3 text-sm text-text">
+          <p className="text-muted">Connect your own Telegram account. Your session is encrypted on the server. Files are stored in your Saved Messages; Telegram does not provide quota reporting.</p>
+          {!telegramChallengeId ? <label className="grid gap-1">Phone number in international format<Input type="tel" placeholder="+15551234567" autoComplete="tel" value={telegramPhone} onChange={(event) => setTelegramPhone(event.target.value)} required /></label> : telegramNeedsPassword ? <label className="grid gap-1">Two-step verification password<Input type="password" autoComplete="current-password" value={telegramPassword} onChange={(event) => setTelegramPassword(event.target.value)} required /></label> : <label className="grid gap-1">Telegram login code<Input inputMode="numeric" autoComplete="one-time-code" value={telegramCode} onChange={(event) => setTelegramCode(event.target.value)} required /></label>}
+          {telegramError ? <p role="alert" className="text-danger">{telegramError}</p> : null}
+        </form>
       </Dialog>
       {error ? <p role="alert" className="mt-5 rounded-[10px] border border-danger px-4 py-3 text-[13px] text-danger">{error}</p> : null}
       {message ? <p role="status" className="mt-5 rounded-[10px] border border-border bg-surface px-4 py-3 text-[13px] text-text">{message}</p> : null}
